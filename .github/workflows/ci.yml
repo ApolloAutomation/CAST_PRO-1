@@ -4,19 +4,18 @@ on:
   pull_request:
 
 permissions:
-  pull-requests: write
-  issues: write
   contents: read
 
+# Label check lives in label-check.yml on pull_request_target so it can
+# label fork-submitted PRs; plain pull_request tokens are read-only there.
 jobs:
-  label-check:
-    name: Label Check
-    uses: ApolloAutomation/Workflows/.github/workflows/label-check.yml@main
-
   ci:
     name: CI
     uses: ApolloAutomation/Workflows/.github/workflows/esphome-ci.yml@main
     with:
-      # TODO: Rename to this product's YAML files
       yaml-files: |
-        Integrations/ESPHome/AIR-1.yaml
+        Integrations/ESPHome/CAST_PRO-1.yaml
+      esphome-versions: |
+        stable
+        beta
+        dev

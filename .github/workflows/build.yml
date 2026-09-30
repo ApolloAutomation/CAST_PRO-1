@@ -11,6 +11,8 @@ on:
         type: boolean
         required: false
         default: false
+  # release:
+  #   types: [published]
 
 jobs:
   build-and-publish:
@@ -21,11 +23,12 @@ jobs:
       id-token: write
       pull-requests: write
     with:
-      # TODO: Rename to this product's device name and YAML files
-      device-name: producttemplate
+      device-name: cast_pro-1
       yaml-files: |
-        Integrations/ESPHome/AIR-1.yaml
-      firmware-names: ":firmware"
+        Integrations/ESPHome/CAST_PRO-1.yaml
+      # Maps CAST_PRO-1.yaml to the firmware/ output dir (the shared workflow's
+      # pattern key is everything after the last dash of the filename).
+      firmware-names: "1:firmware"
       core-yaml-path: Integrations/ESPHome/Core.yaml
       esphome-version: stable
       # Bypass check if manually triggered with bypass option
