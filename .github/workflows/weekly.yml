@@ -1,21 +1,20 @@
-name: CI
+name: Weekly Firmware Build
 
 on:
-  pull_request:
+  schedule:
+    - cron: '0 0 * * 1'
 
 permissions:
   contents: read
 
-# Label check lives in label-check.yml on pull_request_target so it can
-# label fork-submitted PRs; plain pull_request tokens are read-only there.
 jobs:
-  ci:
-    name: CI
+  build:
+    name: Weekly Build
     uses: ApolloAutomation/Workflows/.github/workflows/esphome-ci.yml@main
     with:
       yaml-files: |
         Integrations/ESPHome/CAST_PRO-1.yaml
+      # dev excluded until the TemplateSelect .state incompatibility is fixed
       esphome-versions: |
         stable
         beta
-        dev

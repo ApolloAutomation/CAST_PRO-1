@@ -1,0 +1,14 @@
+# Apollo CAST_PRO-1; device config lives in Core.yaml
+
+esphome:
+  name: "apollo-cast-pro-1"
+  project:
+    name: "ApolloAutomation.CAST_PRO-1"
+    version: ${version}
+
+dashboard_import:
+  package_import_url: github://ApolloAutomation/CAST_PRO-1/Integrations/ESPHome/CAST_PRO-1.yaml
+  import_full_config: false
+
+packages:
+  core: !include Core.yaml
