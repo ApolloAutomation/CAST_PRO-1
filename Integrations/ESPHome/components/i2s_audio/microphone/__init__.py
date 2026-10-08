@@ -14,7 +14,6 @@ from esphome.types import ConfigType
 
 from .. import (
     CONF_ADC_TYPE,
-    CONF_I2S_AUDIO_ID,
     CONF_I2S_DIN_PIN,
     CONF_LEFT,
     CONF_MONO,
@@ -153,8 +152,6 @@ async def to_code(config: ConfigType) -> None:
     await microphone.register_microphone(var, config)
 
     cg.add(var.set_din_pin(config[CONF_I2S_DIN_PIN]))
-    parent = await cg.get_variable(config[CONF_I2S_AUDIO_ID])
-    cg.add(parent.set_din_pin(config[CONF_I2S_DIN_PIN]))
     cg.add(var.set_pdm(config[CONF_PDM]))
     if esp32.get_esp32_variant() in PDM_VARIANTS:
         cg.add(var.set_pdm_dsr(config[CONF_PDM_DSR]))

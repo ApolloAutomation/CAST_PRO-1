@@ -7,9 +7,6 @@
 #include "esphome/core/helpers.h"
 #include <esp_idf_version.h>
 #include <driver/i2s_std.h>
-#include <freertos/event_groups.h>
-#include <freertos/queue.h>
-#include <atomic>
 
 namespace esphome::i2s_audio {
 
@@ -35,12 +32,52 @@ class I2SAudioBase : public Parented<I2SAudioComponent> {
   i2s_mclk_multiple_t mclk_multiple_;
 };
 
-class I2SAudioIn : public I2SAudioBase {};
+class I2SAudioIn : public I2SAudioBase {
+#ifdef USE_I2S_AUDIO_FULL_DUPLEX
+ public:
+  /// @brief Builds the RX configuration the parent uses to set up a full duplex channel pair.
+  /// @return false if this input cannot share a full duplex bus
+  virtual bool build_full_duplex_config(i2s_std_config_t &std_cfg) = 0;
+#endif
+};
 
-class I2SAudioOut : public I2SAudioBase {};
+class I2SAudioOut : public I2SAudioBase {
+#ifdef USE_I2S_AUDIO_FULL_DUPLEX
+ public:
+  /// @brief Builds the TX configuration the parent uses to set up a full duplex channel pair. The channel
+  /// configuration (DMA layout, role, interrupt priority) is shared by both channels.
+  /// @return false if this output cannot share a full duplex bus
+  virtual bool build_full_duplex_config(i2s_chan_config_t &chan_cfg, i2s_std_config_t &std_cfg) { return false; }
+#endif
+};
 
 class I2SAudioComponent final : public Component {
  public:
+#ifdef USE_I2S_AUDIO_FULL_DUPLEX
+  void setup() override;
+
+  void set_audio_in(I2SAudioIn *audio_in) { this->audio_in_ = audio_in; }
+  void set_audio_out(I2SAudioOut *audio_out) { this->audio_out_ = audio_out; }
+
+  /// @brief True when a microphone and a speaker share this bus at the same time.
+  bool is_full_duplex() const { return this->audio_in_ != nullptr && this->audio_out_ != nullptr; }
+
+  /// @brief Enables the full duplex RX channel. Main loop only.
+  /// @return The enabled RX handle, or nullptr if the channel pair is unavailable
+  i2s_chan_handle_t acquire_rx_channel();
+  /// @brief Releases the RX channel; it keeps running while the TX side needs its clocks. Main loop only.
+  void release_rx_channel();
+
+  /// @brief Starts the shared clocks and hands over the full duplex TX channel, still disabled, so the caller
+  /// can register callbacks and preload data before enabling it. Main loop only.
+  /// @return The TX handle, or nullptr if the channel pair is unavailable or another speaker holds it
+  i2s_chan_handle_t acquire_tx_channel();
+  /// @brief Disables the TX channel and stops the shared clocks if the RX side is idle. Only the speaker that
+  /// acquired the channel may call this. Main loop only.
+  void release_tx_channel();
+  /// @brief True while another speaker holds the full duplex TX channel
+  bool is_tx_in_use() const { return this->tx_in_use_; }
+#endif
   i2s_std_gpio_config_t get_pin_config() const {
     return {.mclk = (gpio_num_t) this->mclk_pin_,
             .bclk = (gpio_num_t) this->bclk_pin_,
@@ -53,27 +90,11 @@ class I2SAudioComponent final : public Component {
                 .ws_inv = false,
             }};
   }
-  i2s_std_gpio_config_t get_full_duplex_pin_config() const {
-    return {.mclk = (gpio_num_t) this->mclk_pin_,
-            .bclk = (gpio_num_t) this->bclk_pin_,
-            .ws = (gpio_num_t) this->lrclk_pin_,
-            .dout = (gpio_num_t) this->dout_pin_,
-            .din = (gpio_num_t) this->din_pin_,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            }};
-  }
 
   void set_mclk_pin(int pin) { this->mclk_pin_ = pin; }
   void set_bclk_pin(int pin) { this->bclk_pin_ = pin; }
   void set_lrclk_pin(int pin) { this->lrclk_pin_ = pin; }
-  void set_din_pin(int pin) { this->din_pin_ = pin; }
-  void set_dout_pin(int pin) { this->dout_pin_ = pin; }
   void set_port(int port) { this->port_ = port; }
-  void set_full_duplex(bool full_duplex) { this->full_duplex_ = full_duplex; }
-  bool is_full_duplex() const { return this->full_duplex_; }
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
   int get_port() const { return this->port_; }
 #else
@@ -84,63 +105,25 @@ class I2SAudioComponent final : public Component {
   bool try_lock() { return this->lock_.try_lock(); }
   void unlock() { this->lock_.unlock(); }
 
-  // Full duplex: TX and RX are allocated together and share one clock/slot config, so the first user's config
-  // wins and a mismatched second user is rejected. TX stays running once started, since it clocks the ADC.
-  esp_err_t setup_full_duplex_rx_channel(const i2s_chan_config_t &chan_cfg, const i2s_std_config_t &std_cfg,
-                                         i2s_chan_handle_t *rx_handle);
-  esp_err_t setup_full_duplex_tx_channel(const i2s_chan_config_t &chan_cfg, const i2s_std_config_t &std_cfg,
-                                         i2s_chan_handle_t *tx_handle);
-  /// Starts the TX clock on silence if it isn't running yet (used by the microphone).
-  esp_err_t ensure_full_duplex_tx_running();
-  /// Joins the TX stream for a speaker task. Leaves `records_queue` holding one zero-frame record per DMA buffer
-  /// that completes before the speaker's first write can play, then routes on_sent events into `event_queue`.
-  esp_err_t attach_full_duplex_speaker(QueueHandle_t event_queue, QueueHandle_t records_queue,
-                                       EventGroupHandle_t event_group, EventBits_t overflow_bits,
-                                       const uint8_t *silence, size_t buffer_bytes);
-  void detach_full_duplex_tx_event_queue(QueueHandle_t queue);
-  size_t get_full_duplex_dma_desc_num() const { return this->full_duplex_dma_desc_num_; }
-  void mark_full_duplex_rx_running() { this->full_duplex_rx_enabled_ = true; }
-  void release_full_duplex_rx_channel(i2s_chan_handle_t rx_handle);
-  void release_full_duplex_tx_channel(i2s_chan_handle_t tx_handle);
-
  protected:
-  esp_err_t allocate_full_duplex_channels_(const i2s_chan_config_t &chan_cfg, const i2s_std_config_t &std_cfg);
-  esp_err_t initialize_full_duplex_channels_(const i2s_std_config_t &std_cfg);
-  esp_err_t start_full_duplex_tx_(const uint8_t *silence, size_t buffer_bytes);
-  size_t get_full_duplex_dma_buffer_bytes_();
-  static bool full_duplex_on_sent_cb(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx);
-
   Mutex lock_;
-  // Serializes full duplex setup between the speaker and microphone tasks; lock_ is unused in full duplex mode
-  Mutex full_duplex_lock_;
+
+#ifdef USE_I2S_AUDIO_FULL_DUPLEX
+  /// @brief Enables the RX channel while either side is active, since it drives the shared clocks.
+  bool update_rx_channel_();
 
   I2SAudioIn *audio_in_{nullptr};
   I2SAudioOut *audio_out_{nullptr};
-  int mclk_pin_{I2S_GPIO_UNUSED};
-  int bclk_pin_{I2S_GPIO_UNUSED};
-  int din_pin_{I2S_GPIO_UNUSED};
-  int dout_pin_{I2S_GPIO_UNUSED};
-  int lrclk_pin_;
-  int port_{};
-  bool full_duplex_{false};
-
   i2s_chan_handle_t rx_handle_{nullptr};
   i2s_chan_handle_t tx_handle_{nullptr};
-  bool rx_channel_initialized_{false};
-  bool tx_channel_initialized_{false};
-  bool full_duplex_tx_enabled_{false};
-  bool full_duplex_rx_enabled_{false};
-  bool full_duplex_tx_callback_registered_{false};
-  size_t full_duplex_dma_desc_num_{0};
-  // Format of the first user, which both channels were initialized with
-  uint32_t full_duplex_sample_rate_{0};
-  uint32_t full_duplex_data_bit_width_{0};
-  uint32_t full_duplex_slot_bit_width_{0};
-  i2s_slot_mode_t full_duplex_slot_mode_{};
-  // Read by the TX ISR; event group and bits are published before the queue
-  std::atomic<QueueHandle_t> full_duplex_tx_event_queue_{nullptr};
-  EventGroupHandle_t full_duplex_tx_event_group_{nullptr};
-  EventBits_t full_duplex_tx_overflow_bits_{0};
+  bool rx_in_use_{false};
+  bool tx_in_use_{false};
+  bool rx_enabled_{false};
+#endif
+  int mclk_pin_{I2S_GPIO_UNUSED};
+  int bclk_pin_{I2S_GPIO_UNUSED};
+  int lrclk_pin_;
+  int port_{};
 };
 
 }  // namespace esphome::i2s_audio
