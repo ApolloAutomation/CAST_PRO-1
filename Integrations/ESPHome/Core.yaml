@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.9.21.1"
+  version: "26.10.8.1"
   stable_manifest_base: "https://apolloautomation.github.io/CAST_PRO-1"
   beta_manifest_base: "https://github.com/ApolloAutomation/CAST_PRO-1/releases/download/beta-fw"
   stable_manifest_dir: "firmware"
@@ -9,18 +9,20 @@ substitutions:
 packages:
   wizmote: !include wizmote.yaml
 
-# Full-duplex i2s_audio; see components/i2s_audio/README.md
+# Full-duplex i2s_audio from esphome/esphome#19959; drop once it ships
 external_components:
   - source:
-      type: local
-      path: components
+      type: git
+      url: https://github.com/esphome/esphome
+      ref: 04d475970e1835ba79ace1e5303749aac833e191
+      path: esphome/components
     components: [i2s_audio]
 
 esphome:
   friendly_name: Apollo CAST_PRO-1
   comment: Apollo CAST_PRO-1
   name_add_mac_suffix: true
-  min_version: 2026.8.0
+  min_version: 2026.10.0b1
   platformio_options:
     board_build.flash_mode: dio
   # List form so wizmote.yaml's on_boot entries merge

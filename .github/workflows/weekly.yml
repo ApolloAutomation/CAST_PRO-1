@@ -15,6 +15,6 @@ jobs:
       yaml-files: |
         Integrations/ESPHome/CAST_PRO-1.yaml
       # dev excluded until the TemplateSelect .state incompatibility is fixed
+      # stable returns with 2026.10.0; full duplex needs it
       esphome-versions: |
-        stable
         beta
