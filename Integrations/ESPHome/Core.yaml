@@ -22,7 +22,7 @@ esphome:
   friendly_name: Apollo CAST_PRO-1
   comment: Apollo CAST_PRO-1
   name_add_mac_suffix: true
-  min_version: 2026.10.0b1
+  min_version: 2026.10.0
   platformio_options:
     board_build.flash_mode: dio
   # List form so wizmote.yaml's on_boot entries merge
