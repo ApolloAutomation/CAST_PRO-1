@@ -17,6 +17,11 @@ external_components:
       ref: 04d475970e1835ba79ace1e5303749aac833e191
       path: esphome/components
     components: [i2s_audio]
+  # Line-in as a Sendspin source; drop once the stock hub wires up source@v1
+  - source:
+      type: local
+      path: components
+    components: [sendspin_source]
 
 esphome:
   friendly_name: Apollo CAST_PRO-1
@@ -62,6 +67,9 @@ esphome:
         - text_sensor.template.publish:
             id: apollo_firmware_version
             state: "${version}"
+        - binary_sensor.template.publish:
+            id: line_in_streaming
+            state: OFF
     - priority: -100
       then:
         - script.execute: apply_ota_source
@@ -82,11 +90,6 @@ esphome:
                   then:
                     - lambda: "id(ethernet_expected) = false;"
                     - wifi.enable:
-    # Line In needs the ADC and mixer set up first
-    - priority: -100
-      then:
-        - lambda: "id(line_in_ready) = true;"
-        - script.execute: line_in_apply
     - priority: -300
       then:
         - if:
@@ -271,7 +274,11 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'false'
-  - id: line_in_ready
+  - id: sendspin_pairing_prompt
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: sendspin_pairing_code_shown
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -345,18 +352,33 @@ binary_sensor:
             id(button_press_timestamp) = millis();
     on_release:
       then:
-        - lambda: |-
-            if (millis() - id(button_press_timestamp) >= 8000) {
-              id(factory_reset_switch).turn_on();
-            }
-            else if (millis() - id(button_press_timestamp) >= 1000) {
-              // StatusCheck
-              id(statusCheck).execute();
-              delay(3000);
-              id(testCycleCount) = 0;
-              id(runTest) = true;
-              id(testScript).execute();
-            }
+        - if:
+            condition:
+              lambda: |-
+                const uint32_t held = millis() - id(button_press_timestamp);
+                return id(sendspin_pairing_prompt) && held >= 1000 && held < 8000;
+            then:
+              - sendspin.confirm_pairing_window: sendspin_hub
+            else:
+              - lambda: |-
+                  if (millis() - id(button_press_timestamp) >= 8000) {
+                    id(factory_reset_switch).turn_on();
+                  }
+                  else if (millis() - id(button_press_timestamp) >= 1000) {
+                    id(status_and_test).execute();
+                  }
+
+  - platform: template
+    id: line_in_streaming
+    name: "Line In Streaming"
+    icon: mdi:audio-input-rca
+    entity_category: diagnostic
+
+  - platform: template
+    id: line_in_signal
+    name: "Line In Signal"
+    icon: mdi:waveform
+    entity_category: diagnostic
 
 sensor:
   - platform: internal_temperature
@@ -379,18 +401,11 @@ switch:
     id: factory_reset_switch
     internal: true
 
-  - platform: template
-    name: "Line In"
-    id: line_in_switch
-    icon: mdi:audio-input-rca
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    on_state:
-      - if:
-          condition:
-            lambda: "return id(line_in_ready);"
-          then:
-            - script.execute: line_in_apply
+  - platform: sendspin
+    id: sendspin_unpaired_access
+    type: unpaired_access
+    name: "Sendspin Unpaired Access"
+    restore_mode: RESTORE_DEFAULT_ON
 
   - platform: template
     name: "Bluetooth Proxy"
@@ -448,6 +463,11 @@ text_sensor:
     id: sendspin_album
     type: album
     name: Album
+
+  - platform: sendspin
+    id: sendspin_pairing_code
+    type: pairing_code
+    name: "Sendspin Pairing Code"
 
   - platform: version
     id: esphome_version_sensor
@@ -586,8 +606,6 @@ speaker:
         timeout: never
       - id: media_mixer_input
         timeout: never
-      - id: line_in_mixer_input
-        timeout: never
 
   # These stacks must stay in internal RAM, so leave task_stack_in_psram unset
   - platform: resampler
@@ -613,20 +631,82 @@ microphone:
     sample_rate: 48000
     bits_per_sample: 32bit
     channel: stereo
-    on_data:
-      - lambda: |-
-          if (id(line_in_switch).state) {
-            id(line_in_mixer_input)->play(x.data(), x.size(), 0);
-          }
 
 sendspin:
   id: sendspin_hub
   # PSRAM stack skews time sync; keep internal
   task_stack_in_psram: false
+  on_display_pairing_code:
+    - lambda: "id(sendspin_pairing_code_shown) = true;"
+    - script.execute:
+        id: pairing_led
+        flash: none
+  on_clear_pairing_code:
+    - lambda: "id(sendspin_pairing_code_shown) = false;"
+    - script.execute:
+        id: pairing_led
+        flash: none
+  on_open_pairing_window:
+    - lambda: "id(sendspin_pairing_prompt) = true;"
+    - script.execute:
+        id: pairing_led
+        flash: none
+  on_close_pairing_window:
+    - lambda: "id(sendspin_pairing_prompt) = false;"
+    - script.execute:
+        id: pairing_led
+        flash: none
+  on_pairing_succeeded:
+    - script.execute:
+        id: pairing_led
+        flash: paired
+  on_pairing_failed:
+    - logger.log:
+        format: "Sendspin pairing failed: %s"
+        args: ["reason.c_str()"]
+    - script.execute:
+        id: pairing_led
+        flash: failed
+
+# The Sendspin spec forbids a player+source device from playing its own input locally
+sendspin_source:
+  id: line_in_source
+  sendspin_id: sendspin_hub
+  microphone:
+    microphone: line_in_adc
+    channels: [0, 1]
+    bits_per_sample: 16
+    gain_factor: 1
+  codec: pcm
+  chunk_duration: 20ms
+  capture_buffer: 500ms
+  line_sense:
+    # Off until the thresholds are checked on hardware
+    enabled: false
+    threshold: -60dB
+    hysteresis: 6dB
+    attack: 100ms
+    release: 2s
+  on_streaming_started:
+    - binary_sensor.template.publish:
+        id: line_in_streaming
+        state: ON
+  on_streaming_stopped:
+    - binary_sensor.template.publish:
+        id: line_in_streaming
+        state: OFF
+  on_signal_present:
+    - binary_sensor.template.publish:
+        id: line_in_signal
+        state: ON
+  on_signal_absent:
+    - binary_sensor.template.publish:
+        id: line_in_signal
+        state: OFF
 
 media_source:
   - platform: sendspin
-    id: sendspin_source
+    id: sendspin_media_source
 
   - platform: audio_http
     id: http_media_source
@@ -660,7 +740,7 @@ media_player:
       num_channels: 2
       sample_rate: 48000
       sources:
-        - sendspin_source
+        - sendspin_media_source
         - http_media_source
 
     on_announcement:
@@ -675,12 +755,9 @@ media_player:
                 red: 0%
                 green: 100%
                 brightness: 50%
+                effect: None
             - mixer_speaker.apply_ducking:
                 id: media_mixer_input
-                decibel_reduction: 40
-                duration: 0.0s
-            - mixer_speaker.apply_ducking:
-                id: line_in_mixer_input
                 decibel_reduction: 40
                 duration: 0.0s
             - wait_until:
@@ -692,13 +769,11 @@ media_player:
                 id: media_mixer_input
                 decibel_reduction: 0
                 duration: 1.0s
-            - mixer_speaker.apply_ducking:
-                id: line_in_mixer_input
-                decibel_reduction: 0
-                duration: 1.0s
-            - light.turn_off:
-                id: rgb_light
             - lambda: id(announcement_triggered) = false;
+            # Turns the LED off, or back to a pairing cue
+            - script.execute:
+                id: pairing_led
+                flash: none
 
     on_state:
       # pcm5122 boots muted; unmute (idempotent)
@@ -712,10 +787,6 @@ media_player:
           then:
             - mixer_speaker.apply_ducking:
                 id: media_mixer_input
-                decibel_reduction: 0
-                duration: 1.0s
-            - mixer_speaker.apply_ducking:
-                id: line_in_mixer_input
                 decibel_reduction: 0
                 duration: 1.0s
 
@@ -739,22 +810,6 @@ interval:
             - script.execute: wifi_recovery_probe
 
 script:
-  - id: line_in_apply
-    then:
-      - if:
-          condition:
-            switch.is_on: line_in_switch
-          then:
-            - lambda: |-
-                id(line_in_mixer_input)->set_audio_stream_info(audio::AudioStreamInfo(32, 2, 48000));
-            - microphone.capture: line_in_adc
-          else:
-            - microphone.stop_capture: line_in_adc
-            - lambda: |-
-                if (!id(line_in_mixer_input)->is_stopped()) {
-                  id(line_in_mixer_input)->stop();
-                }
-
   - id: wifi_recovery_probe
     then:
       - wifi.enable:
@@ -806,6 +861,64 @@ script:
           ESP_LOGI("firmware", "OTA manifest set to: %s", url);
           id(update_http_request).set_source_url(url);
       - component.update: update_http_request
+
+  # Pairing cues on the LED; an announcement keeps the LED and hands back when it ends
+  - id: pairing_led
+    mode: queued
+    parameters:
+      flash: string
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(announcement_triggered) && flash != "none";'
+          then:
+            - light.turn_on:
+                id: rgb_light
+                red: !lambda 'return flash == "paired" ? 0.0f : 1.0f;'
+                green: !lambda 'return flash == "paired" ? 1.0f : 0.0f;'
+                blue: 0%
+                brightness: 100%
+                effect: None
+            - delay: 3s
+      - if:
+          condition:
+            lambda: "return !id(announcement_triggered);"
+          then:
+            - if:
+                condition:
+                  lambda: "return id(sendspin_pairing_prompt);"
+                then:
+                  - light.turn_on:
+                      id: rgb_light
+                      red: 100%
+                      green: 50%
+                      blue: 0%
+                      brightness: 100%
+                      effect: "Fast Pulse"
+                else:
+                  - if:
+                      condition:
+                        lambda: "return id(sendspin_pairing_code_shown);"
+                      then:
+                        - light.turn_on:
+                            id: rgb_light
+                            red: 60%
+                            green: 0%
+                            blue: 100%
+                            brightness: 60%
+                            effect: "Slow Pulse"
+                      else:
+                        - light.turn_off: rgb_light
+
+  - id: status_and_test
+    then:
+      - script.execute: statusCheck
+      - delay: 3s
+      - lambda: |-
+          id(testCycleCount) = 0;
+          id(runTest) = true;
+      - script.execute: testScript
+
   - id: statusCheck
     then:
       - if:
@@ -820,8 +933,10 @@ script:
                 green: 0%
                 blue: 100%
       - delay: 5s
-      - light.turn_off: rgb_light
-  
+      - script.execute:
+          id: pairing_led
+          flash: none
+
   - id: testScript
     then:
       if: 
@@ -856,8 +971,9 @@ script:
                     red: 0%
                     green: 0%
                     blue: 0%
-                - light.turn_off:
-                    id: rgb_light
+                - script.execute:
+                    id: pairing_led
+                    flash: none
                 
               else:
                 - lambda: "id(runTest) = false;"
@@ -872,5 +988,6 @@ script:
                     red: 0%
                     green: 0%
                     blue: 0%
-                - light.turn_off:
-                    id: rgb_light
+                - script.execute:
+                    id: pairing_led
+                    flash: none
