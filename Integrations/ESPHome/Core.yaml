@@ -9,7 +9,7 @@ substitutions:
 packages:
   wizmote: !include wizmote.yaml
 
-# Full-duplex i2s_audio from esphome/esphome#19959; newest ref that loads on 2026.10, drop for 2026.11
+# Full-duplex i2s_audio from esphome/esphome#19959; drop for 2026.11
 external_components:
   - source:
       type: git
@@ -22,7 +22,6 @@ esphome:
   friendly_name: Apollo CAST_PRO-1
   comment: Apollo CAST_PRO-1
   name_add_mac_suffix: true
-  # 2026.10.0b1 would reject 2026.10.0, which sorts below its betas
   min_version: 2026.10.0
   # List form so wizmote.yaml's on_boot entries merge
   on_boot:
@@ -548,7 +547,7 @@ speaker:
     sample_rate: 48000
     i2s_dout_pin: GPIO9
     bits_per_sample: 32bit
-    # In full duplex the DAC is the clock slave and needs MCLK/BCLK >= 6; 256 gives 4 and distorts
+    # 256 distorts in full duplex
     mclk_multiple: 512
     dac_type: external
     channel: stereo
@@ -614,7 +613,7 @@ microphone:
     i2s_din_pin: GPIO15
     sample_rate: 48000
     bits_per_sample: 32bit
-    # Must match dac_speaker on the full-duplex bus
+    # Must match dac_speaker
     mclk_multiple: 512
     channel: stereo
     on_data:

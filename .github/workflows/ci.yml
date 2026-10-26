@@ -15,7 +15,7 @@ jobs:
     with:
       yaml-files: |
         Integrations/ESPHome/CAST_PRO-1.yaml
-      # dev waits for the 2026.11 switch to the in-tree full-duplex i2s_audio
+      # dev returns with 2026.11
       esphome-versions: |
         stable
         beta
