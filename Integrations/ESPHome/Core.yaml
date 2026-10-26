@@ -9,13 +9,11 @@ substitutions:
 packages:
   wizmote: !include wizmote.yaml
 
-# Full-duplex i2s_audio from esphome/esphome#19959; drop for 2026.11
+# Full-duplex i2s_audio from esphome/esphome#19959 (04d47597) with 8 SPDIF DMA buffers
 external_components:
   - source:
-      type: git
-      url: https://github.com/esphome/esphome
-      ref: 04d475970e1835ba79ace1e5303749aac833e191
-      path: esphome/components
+      type: local
+      path: components
     components: [i2s_audio]
 
 esphome:
@@ -216,6 +214,8 @@ esp32:
   framework:
     type: esp-idf
     version: recommended
+    advanced:
+      flash_chip: generic
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_32KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
@@ -230,6 +230,11 @@ esp32:
 
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+
+      # Free internal RAM for the optical output's DMA buffers
+      CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY: "y"
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "8"
+      CONFIG_ESP_WIFI_RX_BA_WIN: "16"
 
 esp32_ble_tracker:
   id: ble_tracker
@@ -565,7 +570,8 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 32bit
     channel: stereo
-    timeout: never
+    # never blocks switching back to Analog
+    timeout: 2s
     buffer_duration: 100ms
 
   - platform: router
