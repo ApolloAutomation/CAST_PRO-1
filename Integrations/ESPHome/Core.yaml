@@ -113,6 +113,8 @@ update:
     id: update_http_request
     name: Firmware Update
     source: ${stable_manifest_base}/${stable_manifest_dir}/manifest.json
+    # Checks go through check_for_update
+    update_interval: never
 
 network:
   id: network_1
@@ -161,7 +163,7 @@ ethernet:
                             - script.execute: wifi_release_radio
         else:
           - lambda: "id(ethernet_expected) = true;"
-    - component.update: update_http_request
+    - script.execute: check_for_update
     - component.update: network_connection
   on_disconnect:
     - lambda: "id(ethernet_expected) = false;"
@@ -172,7 +174,7 @@ wifi:
   id: wifi_1
   on_connect:
     - lambda: "id(wifi_provisioned) = true;"
-    - component.update: update_http_request
+    - script.execute: check_for_update
   on_disconnect:
     # Release WiFi before its 90s fallback hotspot can start
     - if:
@@ -331,6 +333,7 @@ button:
       - delay: 3s
       - script.execute: apply_ota_source
       - script.wait: apply_ota_source
+      - script.wait: check_for_update
       # Give async manifest fetch time to land
       - delay: 5s
       - lambda: id(update_http_request).perform(true);
@@ -778,7 +781,22 @@ interval:
               source->handle_command(media_source::MediaSourceCommand::STOP);
           }
 
+  - interval: 6h
+    then:
+      - script.execute: check_for_update
+
 script:
+  # A check needs ~24 KB of internal RAM, 8 KB of it in one block; HA playback on optical can leave less, so wait
+  - id: check_for_update
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: |-
+              return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240 &&
+                     heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768;
+      - component.update: update_http_request
+
   - id: line_in_apply
     then:
       - if:
@@ -845,7 +863,7 @@ script:
             : "${stable_manifest_base}/${stable_manifest_dir}/manifest.json";
           ESP_LOGI("firmware", "OTA manifest set to: %s", url);
           id(update_http_request).set_source_url(url);
-      - component.update: update_http_request
+      - script.execute: check_for_update
   - id: statusCheck
     then:
       - if:
