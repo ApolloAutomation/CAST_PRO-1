@@ -6,6 +6,7 @@
 
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/core/component.h"
+#include "esphome/core/static_task.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -65,7 +66,7 @@ class I2SAudioMicrophone final : public I2SAudioIn, public microphone::Microphon
   SemaphoreHandle_t active_listeners_semaphore_{nullptr};
   EventGroupHandle_t event_group_{nullptr};
 
-  TaskHandle_t task_handle_{nullptr};
+  StaticTask task_;
 
   gpio_num_t din_pin_{I2S_GPIO_UNUSED};
   i2s_chan_handle_t rx_handle_{nullptr};

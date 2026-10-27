@@ -237,6 +237,10 @@ esp32:
       CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY: "y"
       CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "8"
       CONFIG_ESP_WIFI_RX_BA_WIN: "16"
+      # Each socket's mailbox is internal RAM; the 64 KB window keeps 64 slots from filling
+      CONFIG_LWIP_TCPIP_RECVMBOX_SIZE: "64"
+      CONFIG_LWIP_TCP_RECVMBOX_SIZE: "64"
+      CONFIG_LWIP_TCP_WND_DEFAULT: "65534"
 
 esp32_ble_tracker:
   id: ble_tracker
@@ -641,7 +645,8 @@ media_source:
 
   - platform: audio_http
     id: http_media_source
-    buffer_size: 500000
+    # PSRAM; also covers the read-ahead the old 512 KB TCP window gave
+    buffer_size: 950000
     task_stack_in_psram: true
 
   - platform: audio_http
@@ -762,6 +767,15 @@ interval:
             esp_netif_dns_info_t dns;
             if (esp_netif_get_dns_info(netif, type, &dns) == ESP_OK && dns.ip.u_addr.ip4.addr != 0)
               esp_netif_set_dns_info(netif, type, &dns);
+          }
+
+  # Finished HTTP streams keep their threads, and so internal RAM, until the next play
+  - interval: 1s
+    then:
+      - lambda: |-
+          for (auto *source : {id(http_media_source), id(http_announcement_source)}) {
+            if (source->get_state() == media_source::MediaSourceState::IDLE && source->is_idle())
+              source->handle_command(media_source::MediaSourceCommand::STOP);
           }
 
 script:

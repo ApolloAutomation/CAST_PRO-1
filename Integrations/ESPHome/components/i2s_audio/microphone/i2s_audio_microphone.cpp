@@ -15,7 +15,8 @@ namespace esphome::i2s_audio {
 
 static const UBaseType_t MAX_LISTENERS = 16;
 
-static const uint32_t READ_DURATION_MS = 16;
+// Apollo: 8 ms halves the internal-RAM sample buffer
+static const uint32_t READ_DURATION_MS = 8;
 
 static const size_t TASK_STACK_SIZE = 4096;
 static const ssize_t TASK_PRIORITY = 23;
@@ -415,11 +416,9 @@ void I2SAudioMicrophone::loop() {
     this->state_ = microphone::STATE_RUNNING;
   }
 
-  if ((event_group_bits & MicrophoneEventGroupBits::TASK_STOPPED)) {
+  if ((event_group_bits & MicrophoneEventGroupBits::TASK_STOPPED) && this->task_.deallocate()) {
     ESP_LOGV(TAG, "Task finished, freeing resources and uninstalling driver");
 
-    vTaskDelete(this->task_handle_);
-    this->task_handle_ = nullptr;
     this->stop_driver_();
     xEventGroupClearBits(this->event_group_, ALL_BITS);
     this->status_clear_error();
@@ -452,11 +451,10 @@ void I2SAudioMicrophone::loop() {
         break;
       }
 
-      if (this->task_handle_ == nullptr) {
-        xTaskCreate(I2SAudioMicrophone::mic_task, "mic_task", TASK_STACK_SIZE, (void *) this, TASK_PRIORITY,
-                    &this->task_handle_);
-
-        if (this->task_handle_ == nullptr) {
+      if (!this->task_.is_created()) {
+        // Apollo: stack in PSRAM to keep internal RAM free for optical
+        if (!this->task_.create(I2SAudioMicrophone::mic_task, "mic_task", TASK_STACK_SIZE, (void *) this,
+                                TASK_PRIORITY, true)) {
           ESP_LOGE(TAG, "Task failed to start, retrying in 1 second");
           this->status_momentary_error("task_fail", 1000);
           this->stop_driver_();  // Stops the driver to return the lock; will be reloaded in next attempt
