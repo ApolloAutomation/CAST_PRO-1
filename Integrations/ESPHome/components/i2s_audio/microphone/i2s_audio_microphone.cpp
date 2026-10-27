@@ -3,6 +3,7 @@
 #ifdef USE_ESP32
 
 #include <driver/i2s_std.h>
+#include <esp_heap_caps.h>
 #include <driver/i2s_pdm.h>
 
 #include "esphome/core/hal.h"
@@ -280,7 +281,14 @@ void I2SAudioMicrophone::mic_task(void *params) {
 
     const size_t bytes_to_read = this_microphone->audio_stream_info_.ms_to_bytes(READ_DURATION_MS);
     std::vector<uint8_t> samples;
-    samples.reserve(bytes_to_read);
+    // Apollo: wait for internal RAM instead of aborting on bad_alloc when optical playback is using it
+    while (heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL) < bytes_to_read + 64 &&
+           !(xEventGroupGetBits(this_microphone->event_group_) & MicrophoneEventGroupBits::COMMAND_STOP)) {
+      vTaskDelay(pdMS_TO_TICKS(READ_DURATION_MS));
+    }
+    if (!(xEventGroupGetBits(this_microphone->event_group_) & MicrophoneEventGroupBits::COMMAND_STOP)) {
+      samples.reserve(bytes_to_read);
+    }
 
     xEventGroupSetBits(this_microphone->event_group_, MicrophoneEventGroupBits::TASK_RUNNING);
 
