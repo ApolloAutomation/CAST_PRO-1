@@ -3,7 +3,6 @@
 #ifdef USE_ESP32
 
 #include <driver/i2s_std.h>
-#include <esp_heap_caps.h>
 #include <driver/i2s_pdm.h>
 
 #include "esphome/core/hal.h"
@@ -15,13 +14,12 @@ namespace esphome::i2s_audio {
 
 static const UBaseType_t MAX_LISTENERS = 16;
 
-// Apollo: 8 ms halves the internal-RAM sample buffer
-static const uint32_t READ_DURATION_MS = 8;
+static const uint32_t READ_DURATION_MS = 16;
 
 static const size_t TASK_STACK_SIZE = 4096;
 static const ssize_t TASK_PRIORITY = 23;
 
-static const char *const TAG = "i2s_audio.microphone";
+ESPHOME_LOG_TAG(TAG, "i2s_audio.microphone");
 
 enum MicrophoneEventGroupBits : uint32_t {
   COMMAND_STOP = (1 << 0),  // stops the microphone task, set and cleared by ``loop``
@@ -47,6 +45,13 @@ void I2SAudioMicrophone::setup() {
     this->mark_failed();
     return;
   }
+
+#ifdef USE_I2S_AUDIO_FULL_DUPLEX
+  if (this->parent_->is_full_duplex() && this->parent_->is_failed()) {
+    this->mark_failed(LOG_STR("Full duplex bus setup failed"));
+    return;
+  }
+#endif
 
   this->configure_stream_settings_();
 }
@@ -96,15 +101,6 @@ void I2SAudioMicrophone::start() {
   xSemaphoreTake(this->active_listeners_semaphore_, 0);
 }
 
-i2s_clock_src_t I2SAudioMicrophone::get_clock_source_() const {
-#ifdef I2S_CLK_SRC_APLL
-  if (this->use_apll_) {
-    return I2S_CLK_SRC_APLL;
-  }
-#endif
-  return I2S_CLK_SRC_DEFAULT;
-}
-
 void I2SAudioMicrophone::build_std_config_(i2s_std_config_t &std_cfg) const {
   i2s_std_slot_config_t std_slot_cfg =
       I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG((i2s_data_bit_width_t) this->slot_bit_width_, this->slot_mode_);
@@ -127,13 +123,7 @@ void I2SAudioMicrophone::build_std_config_(i2s_std_config_t &std_cfg) const {
 }
 
 #ifdef USE_I2S_AUDIO_FULL_DUPLEX
-bool I2SAudioMicrophone::build_full_duplex_config(i2s_std_config_t &std_cfg) {
-  if (this->pdm_) {
-    return false;
-  }
-  this->build_std_config_(std_cfg);
-  return true;
-}
+void I2SAudioMicrophone::build_full_duplex_config(i2s_std_config_t &std_cfg) { this->build_std_config_(std_cfg); }
 #endif
 
 bool I2SAudioMicrophone::start_driver_() {
@@ -280,28 +270,24 @@ void I2SAudioMicrophone::mic_task(void *params) {
 
   {  // Ensures the samples vector is freed when the task stops
 
-    const size_t bytes_to_read = this_microphone->audio_stream_info_.ms_to_bytes(READ_DURATION_MS);
-    std::vector<uint8_t> samples;
-    // Apollo: wait for internal RAM instead of aborting on bad_alloc when optical playback is using it
-    while (heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL) < bytes_to_read + 64 &&
-           !(xEventGroupGetBits(this_microphone->event_group_) & MicrophoneEventGroupBits::COMMAND_STOP)) {
-      vTaskDelay(pdMS_TO_TICKS(READ_DURATION_MS));
-    }
-    if (!(xEventGroupGetBits(this_microphone->event_group_) & MicrophoneEventGroupBits::COMMAND_STOP)) {
-      samples.reserve(bytes_to_read);
-    }
+    // Copied so the format cannot change while the task runs
+    const audio::AudioStreamInfo stream_info = this_microphone->audio_stream_info_;
+    const size_t bytes_to_read = stream_info.ms_to_bytes(READ_DURATION_MS);
+    // Apollo: samples in PSRAM to keep internal RAM free for optical
+    std::vector<uint8_t, RAMAllocator<uint8_t>> samples;
+    samples.reserve(bytes_to_read);
 
     xEventGroupSetBits(this_microphone->event_group_, MicrophoneEventGroupBits::TASK_RUNNING);
 
     while (!(xEventGroupGetBits(this_microphone->event_group_) & MicrophoneEventGroupBits::COMMAND_STOP)) {
-      if (this_microphone->data_callbacks_.size() > 0) {
+      if (this_microphone->has_data_callbacks_()) {
         samples.resize(bytes_to_read);
         size_t bytes_read = this_microphone->read_(samples.data(), bytes_to_read, 2 * READ_DURATION_MS);
         samples.resize(bytes_read);
         if (this_microphone->correct_dc_offset_) {
           this_microphone->fix_dc_offset_(samples);
         }
-        this_microphone->data_callbacks_.call(samples);
+        this_microphone->publish_audio_(samples, stream_info);
       } else {
         vTaskDelay(pdMS_TO_TICKS(READ_DURATION_MS));
       }
@@ -315,7 +301,7 @@ void I2SAudioMicrophone::mic_task(void *params) {
   }
 }
 
-void I2SAudioMicrophone::fix_dc_offset_(std::vector<uint8_t> &data) {
+void I2SAudioMicrophone::fix_dc_offset_(std::vector<uint8_t, RAMAllocator<uint8_t>> &data) {
   /**
    * From https://www.musicdsp.org/en/latest/Filters/135-dc-filter.html:
    *
@@ -446,7 +432,7 @@ void I2SAudioMicrophone::loop() {
 
       if (!this->start_driver_()) {
         ESP_LOGE(TAG, "Driver failed to start; retrying in 1 second");
-        this->status_momentary_error("driver_fail", 1000);
+        this->status_momentary_error(1000);
         this->stop_driver_();  // Stop/frees whatever possibly started
         break;
       }
@@ -456,7 +442,7 @@ void I2SAudioMicrophone::loop() {
         if (!this->task_.create(I2SAudioMicrophone::mic_task, "mic_task", TASK_STACK_SIZE, (void *) this,
                                 TASK_PRIORITY, true)) {
           ESP_LOGE(TAG, "Task failed to start, retrying in 1 second");
-          this->status_momentary_error("task_fail", 1000);
+          this->status_momentary_error(1000);
           this->stop_driver_();  // Stops the driver to return the lock; will be reloaded in next attempt
         }
       }

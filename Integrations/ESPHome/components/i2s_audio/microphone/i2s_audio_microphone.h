@@ -35,14 +35,12 @@ class I2SAudioMicrophone final : public I2SAudioIn, public microphone::Microphon
 #endif
 
 #ifdef USE_I2S_AUDIO_FULL_DUPLEX
-  bool build_full_duplex_config(i2s_std_config_t &std_cfg) override;
+  void build_full_duplex_config(i2s_std_config_t &std_cfg) override;
 #endif
 
  protected:
   /// @brief Builds the standard (non-PDM) mode configuration from the configured settings.
   void build_std_config_(i2s_std_config_t &std_cfg) const;
-
-  i2s_clock_src_t get_clock_source_() const;
 
   /// @brief Starts the I2S driver. Updates the ``audio_stream_info_`` member variable with the current setttings.
   /// @return True if succesful, false otherwise
@@ -54,7 +52,7 @@ class I2SAudioMicrophone final : public I2SAudioIn, public microphone::Microphon
   /// @brief Attempts to correct a microphone DC offset; e.g., a microphones silent level is offset from 0. Applies a
   /// correction offset that is updated using an exponential moving average for all samples away from 0.
   /// @param data
-  void fix_dc_offset_(std::vector<uint8_t> &data);
+  void fix_dc_offset_(std::vector<uint8_t, RAMAllocator<uint8_t>> &data);
 
   size_t read_(uint8_t *buf, size_t len, uint32_t timeout_ms);
 

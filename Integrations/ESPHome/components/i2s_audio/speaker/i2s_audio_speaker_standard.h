@@ -21,7 +21,7 @@ class I2SAudioSpeaker final : public I2SAudioSpeakerBase {
   void set_i2s_comm_fmt(I2SCommFmt fmt) { this->i2s_comm_fmt_ = fmt; }
 
 #ifdef USE_I2S_AUDIO_FULL_DUPLEX
-  bool build_full_duplex_config(i2s_chan_config_t &chan_cfg, i2s_std_config_t &std_cfg) override;
+  void build_full_duplex_config(i2s_chan_config_t &chan_cfg, i2s_std_config_t &std_cfg) override;
 #endif
 
  protected:
@@ -37,6 +37,22 @@ class I2SAudioSpeaker final : public I2SAudioSpeakerBase {
   /// @brief The output format of a full duplex bus, fixed by the configuration since the channel is set up once.
   audio::AudioStreamInfo full_duplex_stream_info_() const;
 #endif
+
+  /// @brief Bits per sample that the configured slot takes in DMA memory.
+  uint8_t slot_memory_bits_() const;
+
+#ifdef USE_ESP32_VARIANT_ESP32
+  /// @brief Widens frames to the output bit depth through a small stack buffer and writes them to the peripheral.
+  /// @param input Frames in the incoming stream format
+  /// @param frames Number of frames to widen and write
+  /// @return Bytes written, which is short of the widened size if a write timed out
+  size_t write_widened_(const uint8_t *input, uint32_t frames);
+#endif
+
+  /// @brief Frame multiple for DMA buffers and writes; 2 keeps ESP32 mono sample pairs word-aligned.
+  static uint32_t dma_frame_multiple(const audio::AudioStreamInfo &stream_info) {
+    return esp32_mono_swap_needed(stream_info) ? 2 : 1;
+  }
 
   I2SCommFmt i2s_comm_fmt_{I2SCommFmt::STANDARD};
 };
