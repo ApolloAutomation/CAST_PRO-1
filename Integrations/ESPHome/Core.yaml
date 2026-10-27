@@ -21,6 +21,8 @@ esphome:
   comment: Apollo CAST_PRO-1
   name_add_mac_suffix: true
   min_version: 2026.10.0
+  includes:
+    - <lwip/dns.h>
   # List form so wizmote.yaml's on_boot entries merge
   on_boot:
     - priority: 800
@@ -734,8 +736,8 @@ media_player:
 
 
 
-# Retry a released WiFi while on Ethernet
 interval:
+  # Retry a released WiFi while on Ethernet
   - id: wifi_recovery_interval
     interval: 10min
     then:
@@ -748,6 +750,19 @@ interval:
               - lambda: "return id(wifi_provisioned);"
           then:
             - script.execute: wifi_recovery_probe
+
+  # ESP-IDF clears the DNS servers whenever any interface restarts DHCP, e.g. an unplugged Ethernet port every 15s
+  - interval: 16ms
+    then:
+      - lambda: |-
+          esp_netif_t *netif = esp_netif_get_default_netif();
+          if (netif == nullptr || !ip_addr_isany(dns_getserver(0)))
+            return;
+          for (auto type : {ESP_NETIF_DNS_MAIN, ESP_NETIF_DNS_BACKUP}) {
+            esp_netif_dns_info_t dns;
+            if (esp_netif_get_dns_info(netif, type, &dns) == ESP_OK && dns.ip.u_addr.ip4.addr != 0)
+              esp_netif_set_dns_info(netif, type, &dns);
+          }
 
 script:
   - id: line_in_apply
