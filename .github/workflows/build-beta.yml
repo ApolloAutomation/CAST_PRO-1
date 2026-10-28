@@ -44,10 +44,9 @@ jobs:
       matrix:
         include:
           - { yaml: Integrations/ESPHome/CAST_PRO-1.yaml, name: firmware }
-    uses: esphome/workflows/.github/workflows/build.yml@9f6577fd37b5cf773ab1b9be929714a0dcd15661 # 2026.7.0
+    uses: esphome/workflows/.github/workflows/build.yml@31d160e5f0ffa0ee65d5b27cb55c153d415f2abe # 2026.10.2
     with:
       files: ${{ matrix.yaml }}
-      # Full duplex (esphome/esphome#19959) needs 2026.10; back to stable once it ships
       esphome-version: beta
       combined-name: ${{ matrix.name }}
       release-version: ${{ needs.version.outputs.v }}
@@ -60,7 +59,7 @@ jobs:
       contents: write
     steps:
       - name: Download firmware artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: fw
           pattern: firmware*

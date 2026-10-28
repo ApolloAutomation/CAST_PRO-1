@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.10.8.1"
+  version: "26.10.26.1"
   stable_manifest_base: "https://apolloautomation.github.io/CAST_PRO-1"
   beta_manifest_base: "https://github.com/ApolloAutomation/CAST_PRO-1/releases/download/beta-fw"
   stable_manifest_dir: "firmware"
@@ -9,22 +9,20 @@ substitutions:
 packages:
   wizmote: !include wizmote.yaml
 
-# Full-duplex i2s_audio from esphome/esphome#19959; drop once it ships
+# ESPHome 2026.11 i2s_audio (dev 1a50e139) with 8 SPDIF DMA buffers
 external_components:
   - source:
-      type: git
-      url: https://github.com/esphome/esphome
-      ref: 04d475970e1835ba79ace1e5303749aac833e191
-      path: esphome/components
+      type: local
+      path: components
     components: [i2s_audio]
 
 esphome:
   friendly_name: Apollo CAST_PRO-1
   comment: Apollo CAST_PRO-1
   name_add_mac_suffix: true
-  min_version: 2026.10.0b1
-  platformio_options:
-    board_build.flash_mode: dio
+  min_version: 2026.11.0
+  includes:
+    - <lwip/dns.h>
   # List form so wizmote.yaml's on_boot entries merge
   on_boot:
     - priority: 800
@@ -34,6 +32,14 @@ esphome:
               - lambda: "return id(runTest);"
             then:
               - lambda: "id(testScript).execute();"
+    # Line In without on_data, which keeps an internal-RAM copy of each block
+    - priority: 700
+      then:
+        - lambda: |-
+            id(line_in_adc)->add_data_callback([](const microphone::AudioCapture &capture) {
+              if (id(line_in_switch).state)
+                id(line_in_mixer_input)->play(capture.data.data(), capture.data.size(), 0);
+            });
     # WiFi stays off while Ethernet is expected; after globals (800), before wifi (245)
     - priority: 600
       then:
@@ -115,6 +121,8 @@ update:
     id: update_http_request
     name: Firmware Update
     source: ${stable_manifest_base}/${stable_manifest_dir}/manifest.json
+    # Checks go through check_for_update
+    update_interval: never
 
 network:
   id: network_1
@@ -163,7 +171,7 @@ ethernet:
                             - script.execute: wifi_release_radio
         else:
           - lambda: "id(ethernet_expected) = true;"
-    - component.update: update_http_request
+    - script.execute: check_for_update
     - component.update: network_connection
   on_disconnect:
     - lambda: "id(ethernet_expected) = false;"
@@ -174,7 +182,7 @@ wifi:
   id: wifi_1
   on_connect:
     - lambda: "id(wifi_provisioned) = true;"
-    - component.update: update_http_request
+    - script.execute: check_for_update
   on_disconnect:
     # Release WiFi before its 90s fallback hotspot can start
     - if:
@@ -206,17 +214,20 @@ captive_portal:
 improv_serial:
   id: improv_serial_1
 
-esp32_improv:
+improv_ble:
   id: esp32_improv_1
   authorizer: none
 
 esp32:
   variant: ESP32S3
   flash_size: 8MB
+  flash_mode: dio
   cpu_frequency: 240MHz
   framework:
     type: esp-idf
     version: recommended
+    advanced:
+      flash_chip: generic
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_32KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
@@ -231,6 +242,15 @@ esp32:
 
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+
+      # Free internal RAM for the optical output's DMA buffers
+      CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY: "y"
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "8"
+      CONFIG_ESP_WIFI_RX_BA_WIN: "16"
+      # Each socket's mailbox is internal RAM; the 64 KB window keeps 64 slots from filling
+      CONFIG_LWIP_TCPIP_RECVMBOX_SIZE: "64"
+      CONFIG_LWIP_TCP_RECVMBOX_SIZE: "64"
+      CONFIG_LWIP_TCP_WND_DEFAULT: "65534"
 
 esp32_ble_tracker:
   id: ble_tracker
@@ -321,6 +341,7 @@ button:
       - delay: 3s
       - script.execute: apply_ota_source
       - script.wait: apply_ota_source
+      - script.wait: check_for_update
       # Give async manifest fetch time to land
       - delay: 5s
       - lambda: id(update_http_request).perform(true);
@@ -548,6 +569,8 @@ speaker:
     sample_rate: 48000
     i2s_dout_pin: GPIO9
     bits_per_sample: 32bit
+    # 256 distorts in full duplex
+    mclk_multiple: 512
     dac_type: external
     channel: stereo
     timeout: never
@@ -564,7 +587,8 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 32bit
     channel: stereo
-    timeout: never
+    # never blocks switching back to Analog
+    timeout: 2s
     buffer_duration: 100ms
 
   - platform: router
@@ -612,12 +636,9 @@ microphone:
     i2s_din_pin: GPIO15
     sample_rate: 48000
     bits_per_sample: 32bit
+    # Must match dac_speaker
+    mclk_multiple: 512
     channel: stereo
-    on_data:
-      - lambda: |-
-          if (id(line_in_switch).state) {
-            id(line_in_mixer_input)->play(x.data(), x.size(), 0);
-          }
 
 sendspin:
   id: sendspin_hub
@@ -630,11 +651,14 @@ media_source:
 
   - platform: audio_http
     id: http_media_source
-    buffer_size: 500000
+    # PSRAM; also covers the read-ahead the old 512 KB TCP window gave
+    buffer_size: 950000
+    task_stack_in_psram: true
 
   - platform: audio_http
     id: http_announcement_source
     buffer_size: 250000
+    task_stack_in_psram: true
 
 media_player:
   - platform: sendspin
@@ -723,8 +747,8 @@ media_player:
 
 
 
-# Retry a released WiFi while on Ethernet
 interval:
+  # Retry a released WiFi while on Ethernet
   - id: wifi_recovery_interval
     interval: 10min
     then:
@@ -738,7 +762,44 @@ interval:
           then:
             - script.execute: wifi_recovery_probe
 
+  # ESP-IDF clears the DNS servers whenever any interface restarts DHCP, e.g. an unplugged Ethernet port every 15s
+  - interval: 16ms
+    then:
+      - lambda: |-
+          esp_netif_t *netif = esp_netif_get_default_netif();
+          if (netif == nullptr || !ip_addr_isany(dns_getserver(0)))
+            return;
+          for (auto type : {ESP_NETIF_DNS_MAIN, ESP_NETIF_DNS_BACKUP}) {
+            esp_netif_dns_info_t dns;
+            if (esp_netif_get_dns_info(netif, type, &dns) == ESP_OK && dns.ip.u_addr.ip4.addr != 0)
+              esp_netif_set_dns_info(netif, type, &dns);
+          }
+
+  # Finished HTTP streams keep their threads, and so internal RAM, until the next play
+  - interval: 1s
+    then:
+      - lambda: |-
+          for (auto *source : {id(http_media_source), id(http_announcement_source)}) {
+            if (source->get_state() == media_source::MediaSourceState::IDLE && source->is_idle())
+              source->handle_command(media_source::MediaSourceCommand::STOP);
+          }
+
+  - interval: 6h
+    then:
+      - script.execute: check_for_update
+
 script:
+  # A check needs ~24 KB of internal RAM, 8 KB of it in one block; HA playback on optical can leave less, so wait
+  - id: check_for_update
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: |-
+              return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240 &&
+                     heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768;
+      - component.update: update_http_request
+
   - id: line_in_apply
     then:
       - if:
@@ -805,7 +866,7 @@ script:
             : "${stable_manifest_base}/${stable_manifest_dir}/manifest.json";
           ESP_LOGI("firmware", "OTA manifest set to: %s", url);
           id(update_http_request).set_source_url(url);
-      - component.update: update_http_request
+      - script.execute: check_for_update
   - id: statusCheck
     then:
       - if:
