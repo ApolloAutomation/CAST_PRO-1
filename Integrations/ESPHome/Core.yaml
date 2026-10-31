@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.10.8.1"
+  version: "26.10.30.1"
   stable_manifest_base: "https://apolloautomation.github.io/CAST_PRO-1"
   beta_manifest_base: "https://github.com/ApolloAutomation/CAST_PRO-1/releases/download/beta-fw"
   stable_manifest_dir: "firmware"
@@ -9,22 +9,13 @@ substitutions:
 packages:
   wizmote: !include wizmote.yaml
 
-# Full-duplex i2s_audio from esphome/esphome#19959; drop once it ships
-external_components:
-  - source:
-      type: git
-      url: https://github.com/esphome/esphome
-      ref: 04d475970e1835ba79ace1e5303749aac833e191
-      path: esphome/components
-    components: [i2s_audio]
-
 esphome:
   friendly_name: Apollo CAST_PRO-1
   comment: Apollo CAST_PRO-1
   name_add_mac_suffix: true
-  min_version: 2026.10.0b1
-  platformio_options:
-    board_build.flash_mode: dio
+  min_version: 2026.10.0
+  includes:
+    - <lwip/dns.h>
   # List form so wizmote.yaml's on_boot entries merge
   on_boot:
     - priority: 800
@@ -109,12 +100,18 @@ safe_mode:
 
 logger:
   id: logger_1
+  # ESP-IDF can log from inside lwIP (W5500 TX errors on low RAM); sending that to a connected log viewer
+  # re-enters lwIP and deadlocks the unit
+  logs:
+    esp-idf: NONE
 
 update:
   - platform: http_request
     id: update_http_request
     name: Firmware Update
     source: ${stable_manifest_base}/${stable_manifest_dir}/manifest.json
+    # Checks go through check_for_update
+    update_interval: never
 
 network:
   id: network_1
@@ -163,7 +160,7 @@ ethernet:
                             - script.execute: wifi_release_radio
         else:
           - lambda: "id(ethernet_expected) = true;"
-    - component.update: update_http_request
+    - script.execute: check_for_update
     - component.update: network_connection
   on_disconnect:
     - lambda: "id(ethernet_expected) = false;"
@@ -174,7 +171,7 @@ wifi:
   id: wifi_1
   on_connect:
     - lambda: "id(wifi_provisioned) = true;"
-    - component.update: update_http_request
+    - script.execute: check_for_update
   on_disconnect:
     # Release WiFi before its 90s fallback hotspot can start
     - if:
@@ -206,17 +203,20 @@ captive_portal:
 improv_serial:
   id: improv_serial_1
 
-esp32_improv:
+improv_ble:
   id: esp32_improv_1
   authorizer: none
 
 esp32:
   variant: ESP32S3
   flash_size: 8MB
+  flash_mode: dio
   cpu_frequency: 240MHz
   framework:
     type: esp-idf
     version: recommended
+    advanced:
+      flash_chip: generic
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_32KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
@@ -231,6 +231,15 @@ esp32:
 
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+
+      # Free internal RAM for the optical output's DMA buffers
+      CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY: "y"
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "8"
+      CONFIG_ESP_WIFI_RX_BA_WIN: "16"
+      # Each socket's mailbox is internal RAM; the 64 KB window keeps 64 slots from filling
+      CONFIG_LWIP_TCPIP_RECVMBOX_SIZE: "64"
+      CONFIG_LWIP_TCP_RECVMBOX_SIZE: "64"
+      CONFIG_LWIP_TCP_WND_DEFAULT: "65534"
 
 esp32_ble_tracker:
   id: ble_tracker
@@ -272,6 +281,16 @@ globals:
     restore_value: yes
     initial_value: 'false'
   - id: line_in_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Keeps microphone.capture and stop_capture paired
+  - id: line_in_capturing
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Set by line_in_apply's RAM check
+  - id: line_in_can_start
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -321,6 +340,7 @@ button:
       - delay: 3s
       - script.execute: apply_ota_source
       - script.wait: apply_ota_source
+      - script.wait: check_for_update
       # Give async manifest fetch time to land
       - delay: 5s
       - lambda: id(update_http_request).perform(true);
@@ -521,9 +541,25 @@ select:
                   id: output_router
                   target_speaker: spdif_speaker
             else:
-              - router.speaker.switch_output:
-                  id: output_router
-                  target_speaker: dac_speaker
+              # Line In holds the DAC's port, so stop it first
+              - if:
+                  condition:
+                    lambda: "return id(line_in_ready);"
+                  then:
+                    - script.execute: line_in_apply
+                    - script.wait: line_in_apply
+                    - wait_until:
+                        condition:
+                          lambda: "return id(line_in_adc).is_stopped();"
+                        timeout: 2s
+              # Optical may have been picked again while this waited
+              - if:
+                  condition:
+                    lambda: 'return id(audio_output).current_option() == "Analog";'
+                  then:
+                    - router.speaker.switch_output:
+                        id: output_router
+                        target_speaker: dac_speaker
 
 audio_dac:
   - platform: pcm5122
@@ -532,13 +568,12 @@ audio_dac:
     address: 0x4D
     bits_per_sample: 32bit
 
-# DAC and ADC share one port in full duplex (SPDIF has the other): 48 kHz stereo, 32-bit slots
+# The DAC and the Line In ADC share this port and can't run together; SPDIF has the other
 i2s_audio:
   - id: i2s_main
     i2s_lrclk_pin: GPIO7
     i2s_bclk_pin: GPIO14
     i2s_mclk_pin: GPIO17
-    full_duplex: true
   - id: i2s_spdif
 
 speaker:
@@ -548,6 +583,7 @@ speaker:
     sample_rate: 48000
     i2s_dout_pin: GPIO9
     bits_per_sample: 32bit
+    mclk_multiple: 512
     dac_type: external
     channel: stereo
     timeout: never
@@ -564,7 +600,8 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 32bit
     channel: stereo
-    timeout: never
+    # never blocks switching back to Analog
+    timeout: 2s
     buffer_duration: 100ms
 
   - platform: router
@@ -612,6 +649,7 @@ microphone:
     i2s_din_pin: GPIO15
     sample_rate: 48000
     bits_per_sample: 32bit
+    mclk_multiple: 512
     channel: stereo
     on_data:
       - lambda: |-
@@ -630,11 +668,14 @@ media_source:
 
   - platform: audio_http
     id: http_media_source
-    buffer_size: 500000
+    # PSRAM; also covers the read-ahead the old 512 KB TCP window gave
+    buffer_size: 950000
+    task_stack_in_psram: true
 
   - platform: audio_http
     id: http_announcement_source
     buffer_size: 250000
+    task_stack_in_psram: true
 
 media_player:
   - platform: sendspin
@@ -723,8 +764,8 @@ media_player:
 
 
 
-# Retry a released WiFi while on Ethernet
 interval:
+  # Retry a released WiFi while on Ethernet
   - id: wifi_recovery_interval
     interval: 10min
     then:
@@ -738,30 +779,171 @@ interval:
           then:
             - script.execute: wifi_recovery_probe
 
-script:
-  - id: line_in_apply
+  # ESP-IDF clears the DNS servers whenever any interface restarts DHCP, e.g. an unplugged Ethernet port every 15s
+  - interval: 16ms
     then:
+      - lambda: |-
+          esp_netif_t *netif = esp_netif_get_default_netif();
+          if (netif == nullptr || !ip_addr_isany(dns_getserver(0)))
+            return;
+          for (auto type : {ESP_NETIF_DNS_MAIN, ESP_NETIF_DNS_BACKUP}) {
+            esp_netif_dns_info_t dns;
+            if (esp_netif_get_dns_info(netif, type, &dns) == ESP_OK && dns.ip.u_addr.ip4.addr != 0)
+              esp_netif_set_dns_info(netif, type, &dns);
+          }
+
+  # Finished HTTP streams keep their threads, and so internal RAM, until the next play; a failed announcement also
+  # logs an error every loop until then
+  - interval: 1s
+    then:
+      - lambda: |-
+          for (auto *source : {id(http_media_source), id(http_announcement_source)}) {
+            const auto state = source->get_state();
+            if ((state == media_source::MediaSourceState::IDLE && source->is_idle()) ||
+                (state == media_source::MediaSourceState::ERROR && source == id(http_announcement_source)))
+              source->handle_command(media_source::MediaSourceCommand::STOP);
+          }
+
+  - interval: 6h
+    then:
+      - script.execute: check_for_update
+
+script:
+  # A check needs ~24 KB of internal RAM, 8 KB of it in one block; HA playback on optical can leave less, so wait,
+  # and let a starting Line In take its RAM first
+  - id: check_for_update
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: |-
+              return !(id(line_in_capturing) && !id(line_in_adc).is_running()) &&
+                     heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768 &&
+                     heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240;
+      - component.update: update_http_request
+
+  # Line In shares the DAC's I2S port, so it only plays out Optical
+  - id: line_in_apply
+    mode: queued
+    then:
+      # An Optical pick sent along with Line In may land just after it
+      - wait_until:
+          condition:
+            lambda: 'return !id(line_in_switch).state || id(audio_output).current_option() == "Optical";'
+          timeout: 300ms
       - if:
           condition:
-            switch.is_on: line_in_switch
+            and:
+              - switch.is_on: line_in_switch
+              - lambda: 'return id(audio_output).current_option() != "Optical";'
           then:
-            - lambda: |-
-                id(line_in_mixer_input)->set_audio_stream_info(audio::AudioStreamInfo(32, 2, 48000));
-            - microphone.capture: line_in_adc
-          else:
+            - logger.log:
+                level: WARN
+                format: "Line In needs Optical output; turning it off"
+            - switch.turn_off: line_in_switch
+      - if:
+          condition:
+            and:
+              - switch.is_on: line_in_switch
+              - lambda: "return !id(line_in_capturing);"
+          then:
+            - speaker.stop: dac_speaker
+            # The mic task reboots the unit if it can't get its ~20 KB of internal RAM, so start it only once the
+            # outputs have settled and a trial of the same allocations succeeds
+            - lambda: "id(line_in_can_start) = false;"
+            - wait_until:
+                condition:
+                  lambda: |-
+                    if (!id(line_in_switch).state || id(audio_output).current_option() != "Optical")
+                      return true;
+                    if (!id(dac_speaker).is_stopped() ||
+                        !(id(output_router).is_running() || id(output_router).is_stopped()) ||
+                        !(id(spdif_speaker).is_running() || id(spdif_speaker).is_stopped()) ||
+                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32768)
+                      return false;
+                    static uint32_t last_try = 0;
+                    if (millis() - last_try < 100)
+                      return false;
+                    last_try = millis();
+                    // An update check takes ~24 KB of its own
+                    if (xTaskGetHandle("update_task") != nullptr)
+                      return false;
+                    // In the mic's order: 4 RX DMA buffers, its task stack, then its sample buffer
+                    const size_t sizes[] = {2048, 2048, 2048, 2048, 4096 + 512, 6144 + 512};
+                    void *trial[6] = {};
+                    bool ok = true;
+                    for (int i = 0; ok && i < 6; i++) {
+                      const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | (i < 4 ? MALLOC_CAP_DMA : 0);
+                      ok = (trial[i] = heap_caps_malloc(sizes[i], caps)) != nullptr;
+                    }
+                    for (void *p : trial)
+                      heap_caps_free(p);
+                    id(line_in_can_start) = ok;
+                    return ok;
+                timeout: 30s
+            - if:
+                condition:
+                  lambda: |-
+                    return id(line_in_can_start) && id(line_in_switch).state &&
+                           id(audio_output).current_option() == "Optical";
+                then:
+                  - lambda: |-
+                      id(line_in_mixer_input)->set_audio_stream_info(audio::AudioStreamInfo(32, 2, 48000));
+                      id(line_in_capturing) = true;
+                  - microphone.capture: line_in_adc
+                  # stop_capture is ignored until the mic leaves STOPPED
+                  - wait_until:
+                      condition:
+                        lambda: "return !id(line_in_adc).is_stopped();"
+                      timeout: 1s
+                else:
+                  - if:
+                      condition:
+                        switch.is_on: line_in_switch
+                      then:
+                        - logger.log:
+                            level: WARN
+                            format: "Line In %s; turning it off"
+                            args:
+                              - 'id(audio_output).current_option() == "Optical" ? "couldn''t start" : "needs Optical output"'
+                        - switch.turn_off: line_in_switch
+      - if:
+          condition:
+            and:
+              - switch.is_off: line_in_switch
+              - lambda: "return id(line_in_capturing);"
+          then:
+            - lambda: "id(line_in_capturing) = false;"
             - microphone.stop_capture: line_in_adc
-            - lambda: |-
-                if (!id(line_in_mixer_input)->is_stopped()) {
-                  id(line_in_mixer_input)->stop();
-                }
+            # Also cancels a start the mic task queued that the mixer input hasn't handled yet
+            - lambda: "id(line_in_mixer_input)->stop();"
 
+  # Restarting WiFi as an announcement starts on low internal RAM can crash the unit, so probe only after a minute
+  # with RAM to spare, and if playback starts meanwhile, release the radio once its pipeline is up
   - id: wifi_recovery_probe
+    mode: restart
     then:
+      - wait_until:
+          condition:
+            for:
+              time: 60s
+              condition:
+                lambda: |-
+                  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768 &&
+                         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240;
       - wifi.enable:
       - wait_until:
           condition:
-            wifi.connected:
+            or:
+              - wifi.connected:
+              - lambda: return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 28672;
           timeout: 60s
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - delay: 5s
       - if:
           condition:
             wifi.connected:
@@ -805,7 +987,7 @@ script:
             : "${stable_manifest_base}/${stable_manifest_dir}/manifest.json";
           ESP_LOGI("firmware", "OTA manifest set to: %s", url);
           id(update_http_request).set_source_url(url);
-      - component.update: update_http_request
+      - script.execute: check_for_update
   - id: statusCheck
     then:
       - if:
