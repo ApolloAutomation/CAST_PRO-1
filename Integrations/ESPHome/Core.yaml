@@ -915,13 +915,32 @@ script:
             # Also cancels a start the mic task queued that the mixer input hasn't handled yet
             - lambda: "id(line_in_mixer_input)->stop();"
 
+  # Restarting WiFi as an announcement starts on low internal RAM can crash the unit, so probe only after a minute
+  # with RAM to spare, and if playback starts meanwhile, release the radio once its pipeline is up
   - id: wifi_recovery_probe
+    mode: restart
     then:
+      - wait_until:
+          condition:
+            for:
+              time: 60s
+              condition:
+                lambda: |-
+                  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768 &&
+                         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240;
       - wifi.enable:
       - wait_until:
           condition:
-            wifi.connected:
+            or:
+              - wifi.connected:
+              - lambda: return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 28672;
           timeout: 60s
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - delay: 5s
       - if:
           condition:
             wifi.connected:
