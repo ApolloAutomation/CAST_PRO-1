@@ -792,12 +792,15 @@ interval:
               esp_netif_set_dns_info(netif, type, &dns);
           }
 
-  # Finished HTTP streams keep their threads, and so internal RAM, until the next play
+  # Finished HTTP streams keep their threads, and so internal RAM, until the next play; a failed announcement also
+  # logs an error every loop until then
   - interval: 1s
     then:
       - lambda: |-
           for (auto *source : {id(http_media_source), id(http_announcement_source)}) {
-            if (source->get_state() == media_source::MediaSourceState::IDLE && source->is_idle())
+            const auto state = source->get_state();
+            if ((state == media_source::MediaSourceState::IDLE && source->is_idle()) ||
+                (state == media_source::MediaSourceState::ERROR && source == id(http_announcement_source)))
               source->handle_command(media_source::MediaSourceCommand::STOP);
           }
 
