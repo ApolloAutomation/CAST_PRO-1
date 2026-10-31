@@ -100,6 +100,10 @@ safe_mode:
 
 logger:
   id: logger_1
+  # ESP-IDF can log from inside lwIP (W5500 TX errors on low RAM); sending that to a connected log viewer
+  # re-enters lwIP and deadlocks the unit
+  logs:
+    esp-idf: NONE
 
 update:
   - platform: http_request
