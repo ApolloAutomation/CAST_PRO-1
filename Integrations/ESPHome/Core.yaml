@@ -9,13 +9,6 @@ substitutions:
 packages:
   wizmote: !include wizmote.yaml
 
-# Full-duplex i2s_audio from esphome/esphome#19959 (04d47597) with 8 SPDIF DMA buffers
-external_components:
-  - source:
-      type: local
-      path: components
-    components: [i2s_audio]
-
 esphome:
   friendly_name: Apollo CAST_PRO-1
   comment: Apollo CAST_PRO-1
@@ -287,6 +280,16 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # Keeps microphone.capture and stop_capture paired
+  - id: line_in_capturing
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Set by line_in_apply's RAM check
+  - id: line_in_can_start
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   # WiFi has connected before; the recovery probe never runs otherwise
   - id: wifi_provisioned
     type: bool
@@ -534,9 +537,25 @@ select:
                   id: output_router
                   target_speaker: spdif_speaker
             else:
-              - router.speaker.switch_output:
-                  id: output_router
-                  target_speaker: dac_speaker
+              # Line In holds the DAC's port, so stop it first
+              - if:
+                  condition:
+                    lambda: "return id(line_in_ready);"
+                  then:
+                    - script.execute: line_in_apply
+                    - script.wait: line_in_apply
+                    - wait_until:
+                        condition:
+                          lambda: "return id(line_in_adc).is_stopped();"
+                        timeout: 2s
+              # Optical may have been picked again while this waited
+              - if:
+                  condition:
+                    lambda: 'return id(audio_output).current_option() == "Analog";'
+                  then:
+                    - router.speaker.switch_output:
+                        id: output_router
+                        target_speaker: dac_speaker
 
 audio_dac:
   - platform: pcm5122
@@ -545,13 +564,12 @@ audio_dac:
     address: 0x4D
     bits_per_sample: 32bit
 
-# DAC and ADC share one port in full duplex (SPDIF has the other): 48 kHz stereo, 32-bit slots
+# The DAC and the Line In ADC share this port and can't run together; SPDIF has the other
 i2s_audio:
   - id: i2s_main
     i2s_lrclk_pin: GPIO7
     i2s_bclk_pin: GPIO14
     i2s_mclk_pin: GPIO17
-    full_duplex: true
   - id: i2s_spdif
 
 speaker:
@@ -561,7 +579,6 @@ speaker:
     sample_rate: 48000
     i2s_dout_pin: GPIO9
     bits_per_sample: 32bit
-    # 256 distorts in full duplex
     mclk_multiple: 512
     dac_type: external
     channel: stereo
@@ -628,7 +645,6 @@ microphone:
     i2s_din_pin: GPIO15
     sample_rate: 48000
     bits_per_sample: 32bit
-    # Must match dac_speaker
     mclk_multiple: 512
     channel: stereo
     on_data:
@@ -786,32 +802,114 @@ interval:
       - script.execute: check_for_update
 
 script:
-  # A check needs ~24 KB of internal RAM, 8 KB of it in one block; HA playback on optical can leave less, so wait
+  # A check needs ~24 KB of internal RAM, 8 KB of it in one block; HA playback on optical can leave less, so wait,
+  # and let a starting Line In take its RAM first
   - id: check_for_update
     mode: restart
     then:
       - wait_until:
           condition:
             lambda: |-
-              return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240 &&
-                     heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768;
+              return !(id(line_in_capturing) && !id(line_in_adc).is_running()) &&
+                     heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768 &&
+                     heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240;
       - component.update: update_http_request
 
+  # Line In shares the DAC's I2S port, so it only plays out Optical
   - id: line_in_apply
+    mode: queued
     then:
+      # An Optical pick sent along with Line In may land just after it
+      - wait_until:
+          condition:
+            lambda: 'return !id(line_in_switch).state || id(audio_output).current_option() == "Optical";'
+          timeout: 300ms
       - if:
           condition:
-            switch.is_on: line_in_switch
+            and:
+              - switch.is_on: line_in_switch
+              - lambda: 'return id(audio_output).current_option() != "Optical";'
           then:
-            - lambda: |-
-                id(line_in_mixer_input)->set_audio_stream_info(audio::AudioStreamInfo(32, 2, 48000));
-            - microphone.capture: line_in_adc
-          else:
+            - logger.log:
+                level: WARN
+                format: "Line In needs Optical output; turning it off"
+            - switch.turn_off: line_in_switch
+      - if:
+          condition:
+            and:
+              - switch.is_on: line_in_switch
+              - lambda: "return !id(line_in_capturing);"
+          then:
+            - speaker.stop: dac_speaker
+            # The mic task reboots the unit if it can't get its ~20 KB of internal RAM, so start it only once the
+            # outputs have settled and a trial of the same allocations succeeds
+            - lambda: "id(line_in_can_start) = false;"
+            - wait_until:
+                condition:
+                  lambda: |-
+                    if (!id(line_in_switch).state || id(audio_output).current_option() != "Optical")
+                      return true;
+                    if (!id(dac_speaker).is_stopped() ||
+                        !(id(output_router).is_running() || id(output_router).is_stopped()) ||
+                        !(id(spdif_speaker).is_running() || id(spdif_speaker).is_stopped()) ||
+                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32768)
+                      return false;
+                    static uint32_t last_try = 0;
+                    if (millis() - last_try < 100)
+                      return false;
+                    last_try = millis();
+                    // An update check takes ~24 KB of its own
+                    if (xTaskGetHandle("update_task") != nullptr)
+                      return false;
+                    // In the mic's order: 4 RX DMA buffers, its task stack, then its sample buffer
+                    const size_t sizes[] = {2048, 2048, 2048, 2048, 4096 + 512, 6144 + 512};
+                    void *trial[6] = {};
+                    bool ok = true;
+                    for (int i = 0; ok && i < 6; i++) {
+                      const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | (i < 4 ? MALLOC_CAP_DMA : 0);
+                      ok = (trial[i] = heap_caps_malloc(sizes[i], caps)) != nullptr;
+                    }
+                    for (void *p : trial)
+                      heap_caps_free(p);
+                    id(line_in_can_start) = ok;
+                    return ok;
+                timeout: 30s
+            - if:
+                condition:
+                  lambda: |-
+                    return id(line_in_can_start) && id(line_in_switch).state &&
+                           id(audio_output).current_option() == "Optical";
+                then:
+                  - lambda: |-
+                      id(line_in_mixer_input)->set_audio_stream_info(audio::AudioStreamInfo(32, 2, 48000));
+                      id(line_in_capturing) = true;
+                  - microphone.capture: line_in_adc
+                  # stop_capture is ignored until the mic leaves STOPPED
+                  - wait_until:
+                      condition:
+                        lambda: "return !id(line_in_adc).is_stopped();"
+                      timeout: 1s
+                else:
+                  - if:
+                      condition:
+                        switch.is_on: line_in_switch
+                      then:
+                        - logger.log:
+                            level: WARN
+                            format: "Line In %s; turning it off"
+                            args:
+                              - 'id(audio_output).current_option() == "Optical" ? "couldn''t start" : "needs Optical output"'
+                        - switch.turn_off: line_in_switch
+      - if:
+          condition:
+            and:
+              - switch.is_off: line_in_switch
+              - lambda: "return id(line_in_capturing);"
+          then:
+            - lambda: "id(line_in_capturing) = false;"
             - microphone.stop_capture: line_in_adc
-            - lambda: |-
-                if (!id(line_in_mixer_input)->is_stopped()) {
-                  id(line_in_mixer_input)->stop();
-                }
+            # Also cancels a start the mic task queued that the mixer input hasn't handled yet
+            - lambda: "id(line_in_mixer_input)->stop();"
 
   - id: wifi_recovery_probe
     then:
