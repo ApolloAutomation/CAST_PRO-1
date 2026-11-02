@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Apollo AIR-1 Installer</title>
+    <title>Apollo CAST PRO-1 Installer</title>
     <meta
       name="description"
-      content="Easily allow users to install Apollo AIR-1 firmware on the web."
+      content="Easily allow users to install Apollo CAST PRO-1 firmware on the web."
     />
     <meta name="viewport" content="width=device-width" />
     <meta name="color-scheme" content="dark light" />
@@ -75,22 +75,25 @@
         }
       }
     </style>
-    <script type="module" src="https://unpkg.com/esp-web-tools@8.0.1/dist/web/install-button.js?module"></script>
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
   </head>
   <body>
     <div class="content">
-      <h1>Apollo AIR-1 Installer</h1>
-      
-      <p class="button-row" align="center">
-        <esp-web-install-button manifest="./Integrations/ESPHome/manifest.json">
-        </esp-web-install-button>
-      </p>
+      <h1>Apollo CAST PRO-1 Installer</h1>
+
+      <div class="button-row" style="display: flex; justify-content: center; gap: 20px; align-items: center;">
+        <div>
+          <p>CAST PRO-1 Firmware (WiFi &amp; Ethernet)</p>
+          <esp-web-install-button manifest="./firmware/manifest.json"></esp-web-install-button>
+        </div>
+      </div>
 
       <div class="footer">
-        <a href="https://github.com/ApolloAutomation/AIR-1"
-          >Apollo AIR-1</a
+        <a href="https://github.com/ApolloAutomation/CAST_PRO-1"
+          >Apollo CAST PRO-1</a
         > &mdash;
         Installer powered by <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>.
+      </div>
     </div>
   </body>
 </html>
