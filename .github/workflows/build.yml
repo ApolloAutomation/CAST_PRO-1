@@ -30,7 +30,9 @@ jobs:
       # pattern key is everything after the last dash of the filename).
       firmware-names: "1:firmware"
       core-yaml-path: Integrations/ESPHome/Core.yaml
-      esphome-version: stable
+      # The firmware needs ESPHome 2026.11 (min_version), which is only on dev
+      # until 2026.11.0 ships. Set back to stable once it does.
+      esphome-version: dev
       # Bypass check if manually triggered with bypass option
       check-yaml-changes: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.bypass-yaml-check == 'true') }}
       publish-to-pages: true

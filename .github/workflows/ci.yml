@@ -15,7 +15,7 @@ jobs:
     with:
       yaml-files: |
         Integrations/ESPHome/CAST_PRO-1.yaml
-      # stable returns with 2026.10.0; full duplex needs it
+      # The firmware needs ESPHome 2026.11 (min_version), which is only on dev
+      # until 2026.11.0b1 ships. Restore stable and beta once they reach it.
       esphome-versions: |
-        beta
         dev
