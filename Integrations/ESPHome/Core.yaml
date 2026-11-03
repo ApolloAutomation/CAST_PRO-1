@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.10.30.1"
+  version: "26.11.3.2"
   stable_manifest_base: "https://apolloautomation.github.io/CAST_PRO-1"
   beta_manifest_base: "https://github.com/ApolloAutomation/CAST_PRO-1/releases/download/beta-fw"
   stable_manifest_dir: "firmware"
@@ -8,15 +8,18 @@ substitutions:
 
 packages:
   wizmote: !include wizmote.yaml
+  led_strip: !include led_strip.yaml
+  line_in: !include line_in.yaml
 
 esphome:
   friendly_name: Apollo CAST_PRO-1
   comment: Apollo CAST_PRO-1
   name_add_mac_suffix: true
-  min_version: 2026.10.0
+  # The Sendspin source role arrives in 2026.11; never a b1 here, since ESPHome sorts a release below its betas
+  min_version: 2026.11.0
   includes:
     - <lwip/dns.h>
-  # List form so wizmote.yaml's on_boot entries merge
+  # List form so package on_boot entries (wizmote.yaml, led_strip.yaml, line_in.yaml) merge
   on_boot:
     - priority: 800
       then:
@@ -73,11 +76,6 @@ esphome:
                   then:
                     - lambda: "id(ethernet_expected) = false;"
                     - wifi.enable:
-    # Line In needs the ADC and mixer set up first
-    - priority: -100
-      then:
-        - lambda: "id(line_in_ready) = true;"
-        - script.execute: line_in_apply
     - priority: -300
       then:
         - if:
@@ -280,20 +278,6 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'false'
-  - id: line_in_ready
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  # Keeps microphone.capture and stop_capture paired
-  - id: line_in_capturing
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  # Set by line_in_apply's RAM check
-  - id: line_in_can_start
-    type: bool
-    restore_value: no
-    initial_value: 'false'
   # WiFi has connected before; the recovery probe never runs otherwise
   - id: wifi_provisioned
     type: bool
@@ -365,18 +349,23 @@ binary_sensor:
             id(button_press_timestamp) = millis();
     on_release:
       then:
-        - lambda: |-
-            if (millis() - id(button_press_timestamp) >= 8000) {
-              id(factory_reset_switch).turn_on();
-            }
-            else if (millis() - id(button_press_timestamp) >= 1000) {
-              // StatusCheck
-              id(statusCheck).execute();
-              delay(3000);
-              id(testCycleCount) = 0;
-              id(runTest) = true;
-              id(testScript).execute();
-            }
+        - if:
+            condition:
+              lambda: "return millis() - id(button_press_timestamp) >= 8000;"
+            then:
+              - switch.turn_on: factory_reset_switch
+            else:
+              - if:
+                  condition:
+                    lambda: "return millis() - id(button_press_timestamp) >= 1000;"
+                  then:
+                    - script.execute: statusCheck
+                    # A blocking delay here would stall the main loop, and audio with it
+                    - delay: 3s
+                    - lambda: |-
+                        id(testCycleCount) = 0;
+                        id(runTest) = true;
+                    - script.execute: testScript
 
 sensor:
   - platform: internal_temperature
@@ -398,19 +387,6 @@ switch:
   - platform: factory_reset
     id: factory_reset_switch
     internal: true
-
-  - platform: template
-    name: "Line In"
-    id: line_in_switch
-    icon: mdi:audio-input-rca
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    on_state:
-      - if:
-          condition:
-            lambda: "return id(line_in_ready);"
-          then:
-            - script.execute: line_in_apply
 
   - platform: template
     name: "Bluetooth Proxy"
@@ -489,6 +465,9 @@ light:
     default_transition_length: 0s
     chipset: WS2812
     num_leds: 4
+    # The S3 has 192 RMT TX symbols in total and each strip defaults to all of
+    # them, so split them or the second strip's channel fails
+    rmt_symbols: 48
     channel_colors: GRB
     effects:
       - pulse:
@@ -541,21 +520,10 @@ select:
                   id: output_router
                   target_speaker: spdif_speaker
             else:
-              # Line In holds the DAC's port, so stop it first
+              # A Line In stream holds the DAC's port; line_in.yaml switches back when it stops
               - if:
                   condition:
-                    lambda: "return id(line_in_ready);"
-                  then:
-                    - script.execute: line_in_apply
-                    - script.wait: line_in_apply
-                    - wait_until:
-                        condition:
-                          lambda: "return id(line_in_adc).is_stopped();"
-                        timeout: 2s
-              # Optical may have been picked again while this waited
-              - if:
-                  condition:
-                    lambda: 'return id(audio_output).current_option() == "Analog";'
+                    lambda: "return !id(sendspin_hub)->is_source_streaming();"
                   then:
                     - router.speaker.switch_output:
                         id: output_router
@@ -623,8 +591,6 @@ speaker:
         timeout: never
       - id: media_mixer_input
         timeout: never
-      - id: line_in_mixer_input
-        timeout: never
 
   # These stacks must stay in internal RAM, so leave task_stack_in_psram unset
   - platform: resampler
@@ -651,11 +617,6 @@ microphone:
     bits_per_sample: 32bit
     mclk_multiple: 512
     channel: stereo
-    on_data:
-      - lambda: |-
-          if (id(line_in_switch).state) {
-            id(line_in_mixer_input)->play(x.data(), x.size(), 0);
-          }
 
 sendspin:
   id: sendspin_hub
@@ -720,10 +681,6 @@ media_player:
                 id: media_mixer_input
                 decibel_reduction: 40
                 duration: 0.0s
-            - mixer_speaker.apply_ducking:
-                id: line_in_mixer_input
-                decibel_reduction: 40
-                duration: 0.0s
             - wait_until:
                 media_player.is_announcing: external_media_player
             - wait_until:
@@ -731,10 +688,6 @@ media_player:
                     media_player.is_announcing: external_media_player
             - mixer_speaker.apply_ducking:
                 id: media_mixer_input
-                decibel_reduction: 0
-                duration: 1.0s
-            - mixer_speaker.apply_ducking:
-                id: line_in_mixer_input
                 decibel_reduction: 0
                 duration: 1.0s
             - light.turn_off:
@@ -753,10 +706,6 @@ media_player:
           then:
             - mixer_speaker.apply_ducking:
                 id: media_mixer_input
-                decibel_reduction: 0
-                duration: 1.0s
-            - mixer_speaker.apply_ducking:
-                id: line_in_mixer_input
                 decibel_reduction: 0
                 duration: 1.0s
 
@@ -810,113 +759,17 @@ interval:
 
 script:
   # A check needs ~24 KB of internal RAM, 8 KB of it in one block; HA playback on optical can leave less, so wait,
-  # and let a starting Line In take its RAM first
+  # and let a starting Line In stream take its RAM first
   - id: check_for_update
     mode: restart
     then:
       - wait_until:
           condition:
             lambda: |-
-              return !(id(line_in_capturing) && !id(line_in_adc).is_running()) &&
+              return !(id(sendspin_hub)->is_source_streaming() && !id(line_in_adc).is_running()) &&
                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768 &&
                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240;
       - component.update: update_http_request
-
-  # Line In shares the DAC's I2S port, so it only plays out Optical
-  - id: line_in_apply
-    mode: queued
-    then:
-      # An Optical pick sent along with Line In may land just after it
-      - wait_until:
-          condition:
-            lambda: 'return !id(line_in_switch).state || id(audio_output).current_option() == "Optical";'
-          timeout: 300ms
-      - if:
-          condition:
-            and:
-              - switch.is_on: line_in_switch
-              - lambda: 'return id(audio_output).current_option() != "Optical";'
-          then:
-            - logger.log:
-                level: WARN
-                format: "Line In needs Optical output; turning it off"
-            - switch.turn_off: line_in_switch
-      - if:
-          condition:
-            and:
-              - switch.is_on: line_in_switch
-              - lambda: "return !id(line_in_capturing);"
-          then:
-            - speaker.stop: dac_speaker
-            # The mic task reboots the unit if it can't get its ~20 KB of internal RAM, so start it only once the
-            # outputs have settled and a trial of the same allocations succeeds
-            - lambda: "id(line_in_can_start) = false;"
-            - wait_until:
-                condition:
-                  lambda: |-
-                    if (!id(line_in_switch).state || id(audio_output).current_option() != "Optical")
-                      return true;
-                    if (!id(dac_speaker).is_stopped() ||
-                        !(id(output_router).is_running() || id(output_router).is_stopped()) ||
-                        !(id(spdif_speaker).is_running() || id(spdif_speaker).is_stopped()) ||
-                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32768)
-                      return false;
-                    static uint32_t last_try = 0;
-                    if (millis() - last_try < 100)
-                      return false;
-                    last_try = millis();
-                    // An update check takes ~24 KB of its own
-                    if (xTaskGetHandle("update_task") != nullptr)
-                      return false;
-                    // In the mic's order: 4 RX DMA buffers, its task stack, then its sample buffer
-                    const size_t sizes[] = {2048, 2048, 2048, 2048, 4096 + 512, 6144 + 512};
-                    void *trial[6] = {};
-                    bool ok = true;
-                    for (int i = 0; ok && i < 6; i++) {
-                      const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | (i < 4 ? MALLOC_CAP_DMA : 0);
-                      ok = (trial[i] = heap_caps_malloc(sizes[i], caps)) != nullptr;
-                    }
-                    for (void *p : trial)
-                      heap_caps_free(p);
-                    id(line_in_can_start) = ok;
-                    return ok;
-                timeout: 30s
-            - if:
-                condition:
-                  lambda: |-
-                    return id(line_in_can_start) && id(line_in_switch).state &&
-                           id(audio_output).current_option() == "Optical";
-                then:
-                  - lambda: |-
-                      id(line_in_mixer_input)->set_audio_stream_info(audio::AudioStreamInfo(32, 2, 48000));
-                      id(line_in_capturing) = true;
-                  - microphone.capture: line_in_adc
-                  # stop_capture is ignored until the mic leaves STOPPED
-                  - wait_until:
-                      condition:
-                        lambda: "return !id(line_in_adc).is_stopped();"
-                      timeout: 1s
-                else:
-                  - if:
-                      condition:
-                        switch.is_on: line_in_switch
-                      then:
-                        - logger.log:
-                            level: WARN
-                            format: "Line In %s; turning it off"
-                            args:
-                              - 'id(audio_output).current_option() == "Optical" ? "couldn''t start" : "needs Optical output"'
-                        - switch.turn_off: line_in_switch
-      - if:
-          condition:
-            and:
-              - switch.is_off: line_in_switch
-              - lambda: "return id(line_in_capturing);"
-          then:
-            - lambda: "id(line_in_capturing) = false;"
-            - microphone.stop_capture: line_in_adc
-            # Also cancels a start the mic task queued that the mixer input hasn't handled yet
-            - lambda: "id(line_in_mixer_input)->stop();"
 
   # Restarting WiFi as an announcement starts on low internal RAM can crash the unit, so probe only after a minute
   # with RAM to spare, and if playback starts meanwhile, release the radio once its pipeline is up
@@ -995,12 +848,34 @@ script:
             - lambda: 'return id(ink_ha_connected).state;'
           then:
             - logger.log: "Apollo Automation: Connected To HA"
-            - light.turn_on: 
+            - light.turn_on:
                 id: rgb_light
                 brightness: 100%
                 red: 0%
                 green: 0%
                 blue: 100%
+          else:
+            - if:
+                condition:
+                  or:
+                    - ethernet.connected:
+                    - wifi.connected:
+                then:
+                  - logger.log: "Apollo Automation: Connected To Network"
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: 100%
+                      red: 0%
+                      green: 100%
+                      blue: 0%
+                else:
+                  - logger.log: "Apollo Automation: Not Connected To Network"
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: 100%
+                      red: 100%
+                      green: 100%
+                      blue: 0%
       - delay: 5s
       - light.turn_off: rgb_light
   

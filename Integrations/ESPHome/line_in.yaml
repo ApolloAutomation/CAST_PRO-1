@@ -1,0 +1,155 @@
+# Aux input as a Sendspin source for Music Assistant; included by Core.yaml
+
+globals:
+  # Read before the Sendspin hub sets up, so a Line In Streaming change applies after a restart
+  - id: line_in_stream_compressed
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+  # Set by line_in_capture_start's RAM check
+  - id: line_in_can_start
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+esphome:
+  on_boot:
+    # After globals restore (800), before the Sendspin hub sets up (200). ESPHome has no codec option for the
+    # source yet, so this sets sendspin-cpp's source config directly
+    - priority: 700
+      then:
+        - lambda: |-
+            ::sendspin::SourceRoleConfig cfg;
+            cfg.sample_rate = 48000;
+            cfg.channels = 2;
+            cfg.bit_depth = 16;
+            cfg.psram_stack = true;
+            // Rides out longer WiFi stalls; the buffer lives in PSRAM
+            cfg.capture_buffer_ms = 2000;
+            if (id(line_in_stream_compressed))
+              cfg.codec = ::sendspin::SendspinCodecFormat::OPUS;
+            id(sendspin_hub)->set_source_config(cfg);
+
+sendspin:
+  source:
+    microphone:
+      microphone: line_in_adc
+      channels: [0, 1]
+    task_stack_in_psram: true
+    on_streaming_started:
+      # Hand back the hub's mic start; line_in_capture_start starts it once there's RAM for it
+      - lambda: "id(line_in_adc).stop();"
+      # The ADC shares the analog DAC's I2S port, so this unit plays on Optical while streaming
+      - if:
+          condition:
+            lambda: 'return id(audio_output).current_option() == "Analog";'
+          then:
+            - logger.log:
+                level: WARN
+                format: "Line In shares the Analog output's port; this unit plays on Optical while streaming"
+      - router.speaker.switch_output:
+          id: output_router
+          target_speaker: spdif_speaker
+      - speaker.stop: dac_speaker
+      - script.execute: line_in_capture_start
+    on_streaming_stopped:
+      - script.stop: line_in_capture_start
+      - if:
+          condition:
+            lambda: 'return id(audio_output).current_option() == "Analog";'
+          then:
+            - router.speaker.switch_output:
+                id: output_router
+                target_speaker: dac_speaker
+
+switch:
+  # Tells Music Assistant the aux input has audio, so it can start or stop playing it
+  - platform: template
+    name: "Line In"
+    id: line_in_switch
+    icon: mdi:audio-input-rca
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - sendspin.source.set_signal:
+          present: true
+    on_turn_off:
+      - sendspin.source.set_signal:
+          present: false
+
+select:
+  # Compressed (Opus, ~128 kbps) suits WiFi; Lossless (PCM, ~1.5 Mbps) needs Ethernet or strong WiFi.
+  # Restarts to apply
+  - platform: template
+    id: line_in_streaming
+    name: "Line In Streaming"
+    icon: mdi:access-point-network
+    entity_category: config
+    options:
+      - "Compressed (best for WiFi)"
+      - "Lossless (Ethernet or strong WiFi)"
+    lambda: |-
+      return std::string(id(line_in_stream_compressed) ? "Compressed (best for WiFi)"
+                                                        : "Lossless (Ethernet or strong WiFi)");
+    set_action:
+      - if:
+          condition:
+            lambda: 'return (x == "Compressed (best for WiFi)") != id(line_in_stream_compressed);'
+          then:
+            - lambda: 'id(line_in_stream_compressed) = (x == "Compressed (best for WiFi)");'
+            - script.execute: line_in_streaming_restart
+
+script:
+  # The mic task reboots the unit if its sample buffer doesn't fit in internal RAM, so start it only once the DAC
+  # has let go of the port and a trial of the same allocations succeeds
+  - id: line_in_capture_start
+    mode: restart
+    then:
+      - lambda: "id(line_in_can_start) = false;"
+      - wait_until:
+          condition:
+            lambda: |-
+              if (!id(sendspin_hub)->is_source_streaming())
+                return true;
+              if (!id(dac_speaker).is_stopped())
+                return false;
+              static uint32_t last_try = 0;
+              if (millis() - last_try < 100)
+                return false;
+              last_try = millis();
+              // An update check takes ~24 KB of its own
+              if (xTaskGetHandle("update_task") != nullptr)
+                return false;
+              // 4 RX DMA buffers, the mic task stack, its sample buffer, then the source's converted samples
+              const size_t sizes[] = {2048, 2048, 2048, 2048, 4096 + 512, 6144 + 512, 3072 + 512};
+              void *trial[7] = {};
+              bool ok = true;
+              for (int i = 0; ok && i < 7; i++) {
+                const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | (i < 4 ? MALLOC_CAP_DMA : 0);
+                ok = (trial[i] = heap_caps_malloc(sizes[i], caps)) != nullptr;
+              }
+              for (void *p : trial)
+                heap_caps_free(p);
+              id(line_in_can_start) = ok;
+              return ok;
+          timeout: 30s
+      - if:
+          condition:
+            lambda: "return id(line_in_can_start) && id(sendspin_hub)->is_source_streaming();"
+          then:
+            - microphone.capture: line_in_adc
+          else:
+            - if:
+                condition:
+                  lambda: "return id(sendspin_hub)->is_source_streaming();"
+                then:
+                  - logger.log:
+                      level: WARN
+                      format: "Line In couldn't start: not enough free memory"
+
+  - id: line_in_streaming_restart
+    mode: restart
+    then:
+      # Lets Home Assistant get the reply first; the restart saves the setting
+      - delay: 500ms
+      - button.press: restart_button
