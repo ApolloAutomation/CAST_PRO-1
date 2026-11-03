@@ -483,11 +483,11 @@ binary_sensor:
     internal: true
     # Sendspin's player and the HTTP source report stop at once; the main
     # player only goes idle ~10s later, once its buffers drain. Line In counts
-    # while it's capturing
+    # while it's streaming to Music Assistant
     lambda: |-
       return id(sendspin_group_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING ||
              id(http_media_source)->get_state() == media_source::MediaSourceState::PLAYING ||
-             id(line_in_capturing);
+             id(sendspin_hub)->is_source_streaming();
     filters:
       # Bridge track changes and rebuffering so the strip doesn't blink off
       - delayed_off: 3s
