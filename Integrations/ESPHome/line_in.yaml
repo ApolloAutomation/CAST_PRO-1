@@ -29,6 +29,11 @@ esphome:
             if (id(line_in_stream_compressed))
               cfg.codec = ::sendspin::SendspinCodecFormat::OPUS;
             id(sendspin_hub)->set_source_config(cfg);
+    # The aux jack can't sense audio, so it always reports some; Music Assistant plays it when it's picked
+    - priority: -100
+      then:
+        - sendspin.source.set_signal:
+            present: true
 
 sendspin:
   source:
@@ -61,21 +66,6 @@ sendspin:
             - router.speaker.switch_output:
                 id: output_router
                 target_speaker: dac_speaker
-
-switch:
-  # Tells Music Assistant the aux input has audio, so it can start or stop playing it
-  - platform: template
-    name: "Line In"
-    id: line_in_switch
-    icon: mdi:audio-input-rca
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    on_turn_on:
-      - sendspin.source.set_signal:
-          present: true
-    on_turn_off:
-      - sendspin.source.set_signal:
-          present: false
 
 select:
   # Compressed (Opus, ~128 kbps) suits WiFi; Lossless (PCM, ~1.5 Mbps) needs Ethernet or strong WiFi.
