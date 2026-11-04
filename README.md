@@ -47,6 +47,8 @@ One firmware covers both WiFi and Ethernet, so there is no need to pick a varian
 - **Ethernet plugged in:** traffic moves to Ethernet. If the device is also joined to your WiFi, that connection stays up alongside, so Home Assistant never loses the device when you plug or unplug the cable. If WiFi has no network to join, it turns off entirely, and the setup hotspot is never active while Ethernet is connected.
 - **No Ethernet:** WiFi works as usual. The device rejoins its saved network, or opens the "Apollo CAST_PRO-1 Hotspot" for setup if none is configured (Improv via Bluetooth or USB works too).
 
+When you join the hotspot, your phone should open the WiFi setup page on its own. If it doesn't, go to [http://192.168.4.1/setup](http://192.168.4.1/setup). The bare http://192.168.4.1 address opens the device's web page instead.
+
 Use the **Network Connection** sensor (under Diagnostic on the device page) to see which connection is active at a glance. The **Bluetooth Proxy** switch is off by default. Turn it on to use the CAST PRO-1 as a Bluetooth proxy for Home Assistant.
 
 ## Status Check and Factory Reset
