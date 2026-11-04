@@ -11,6 +11,44 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # The ADC task reboots the unit if its buffers don't fit in internal RAM, so try them first: 4 RX DMA buffers, the
+  # task stack, the sample buffer, then the stream's converted samples
+  - id: line_in_ram_ok
+    type: std::function<bool()>
+    restore_value: no
+    initial_value: |-
+      []() {
+        const size_t sizes[] = {2048, 2048, 2048, 2048, 4096 + 512, 6144 + 512, 3072 + 512};
+        void *trial[7] = {};
+        bool ok = true;
+        for (int i = 0; ok && i < 7; i++) {
+          const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | (i < 4 ? MALLOC_CAP_DMA : 0);
+          ok = (trial[i] = heap_caps_malloc(sizes[i], caps)) != nullptr;
+        }
+        for (void *p : trial)
+          heap_caps_free(p);
+        return ok;
+      }
+  # Line In Signal Detection holds one line_in_adc start while idle
+  - id: line_sense_holding
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # A Line In stream took over that start
+  - id: line_sense_handed_over
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # The signal Music Assistant was last told
+  - id: line_sense_reported
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  # Written by the ADC task: the last ~0.1 s window's power (float bits) and a count of windows
+  - id: line_sense_power
+    type: std::atomic<uint32_t>
+  - id: line_sense_windows
+    type: std::atomic<uint32_t>
 
 esphome:
   on_boot:
@@ -29,10 +67,40 @@ esphome:
             if (id(line_in_stream_compressed))
               cfg.codec = ::sendspin::SendspinCodecFormat::OPUS;
             id(sendspin_hub)->set_source_config(cfg);
-        # The jack has no sense line, so the source always reports audio and
-        # Music Assistant can start it any time
+        # Present until Line In Signal Detection hears a change. Music Assistant takes the first report after a
+        # connect silently, so the boot report itself never starts a source
         - sendspin.source.set_signal:
             present: true
+        # Runs on the ADC task whenever the ADC runs, so it only does arithmetic
+        - lambda: |-
+            id(line_in_adc).add_data_callback([](const microphone::AudioCapture &capture) {
+              static int64_t sum[2] = {}, squares[2] = {};
+              static uint32_t frames = 0;
+              if (capture.stream_info.get_bits_per_sample() != 32 || capture.stream_info.get_channels() != 2)
+                return;
+              const int32_t *samples = reinterpret_cast<const int32_t *>(capture.data.data());
+              const size_t count = capture.data.size() / 8;
+              for (size_t i = 0; i < 2 * count; i++) {
+                const int32_t x = samples[i] >> 8;
+                sum[i & 1] += x;
+                squares[i & 1] += (int64_t) x * x;
+              }
+              frames += count;
+              if (frames < 4800)
+                return;
+              // Louder channel's power without DC, on 24-bit samples; 1.0 is a full-scale square wave
+              float power = 0;
+              for (int c = 0; c < 2; c++) {
+                const double mean = (double) sum[c] / frames;
+                power = std::max(power, (float) (((double) squares[c] / frames - mean * mean) / 70368744177664.0));
+                sum[c] = squares[c] = 0;
+              }
+              frames = 0;
+              uint32_t bits;
+              memcpy(&bits, &power, sizeof(bits));
+              id(line_sense_power).store(bits);
+              id(line_sense_windows).fetch_add(1);
+            });
 
 sendspin:
   source:
@@ -41,8 +109,16 @@ sendspin:
       channels: [0, 1]
     task_stack_in_psram: true
     on_streaming_started:
-      # Hand back the hub's mic start; line_in_capture_start starts it once there's RAM for it
-      - lambda: "id(line_in_adc).stop();"
+      # Hand back the hub's mic start; line_in_capture_start starts it once there's RAM for it. A running Line In
+      # Signal Detection start passes to the stream instead
+      - lambda: |-
+          id(line_in_adc).stop();
+          if (id(line_sense_holding) && !id(line_in_adc).is_running()) {
+            id(line_in_adc).stop();
+            id(line_sense_holding) = false;
+          }
+          id(line_sense_handed_over) = id(line_sense_holding);
+          id(line_sense_holding) = false;
       # The ADC shares the analog DAC's I2S port, so this unit plays on Optical while streaming
       - if:
           condition:
@@ -58,6 +134,7 @@ sendspin:
       - script.execute: line_in_capture_start
     on_streaming_stopped:
       - script.stop: line_in_capture_start
+      - lambda: "id(line_sense_handed_over) = false;"
       - if:
           condition:
             lambda: 'return id(audio_output).current_option() == "Analog";'
@@ -88,6 +165,211 @@ select:
             - lambda: 'id(line_in_stream_compressed) = (x == "Compressed (best for WiFi)");'
             - script.execute: line_in_streaming_restart
 
+switch:
+  # Tells Music Assistant when Line In audio starts and stops, for its "Automatically play line-in on" setting.
+  # Listens while idle on Optical and while Line In streams
+  - platform: template
+    id: line_in_signal_detection
+    name: "Line In Signal Detection"
+    icon: mdi:waveform
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+number:
+  # A signal starts after about 1 s at or above this level and ends after about 10 s at 6 dB below it
+  - platform: template
+    id: line_in_signal_threshold
+    name: "Line In Signal Threshold"
+    icon: mdi:tune-vertical
+    entity_category: config
+    disabled_by_default: true
+    unit_of_measurement: "dBFS"
+    mode: box
+    min_value: -80
+    max_value: -20
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: -50
+
+binary_sensor:
+  # Unknown while the unit isn't listening
+  - platform: template
+    id: line_in_signal
+    name: "Line In Signal"
+    device_class: sound
+    entity_category: diagnostic
+    disabled_by_default: true
+
+sensor:
+  # About a second's average while the unit listens
+  - platform: template
+    id: line_in_level
+    name: "Line In Level"
+    icon: mdi:volume-high
+    unit_of_measurement: "dBFS"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+
+interval:
+  # Listens while idle only on Optical, where the analog DAC never needs the ADC's port, and gives the port back as
+  # soon as anything plays. Only changes are sent to Music Assistant
+  - id: line_in_signal_monitor
+    interval: 50ms
+    startup_delay: 60s
+    then:
+      - lambda: |-
+          static uint32_t idle_since = 0, hold_start = 0, failed_at = 0, playing_since = 0, measure_start = 0;
+          static uint32_t last_window = 0, loud = 0, quiet = 0, level_windows = 0;
+          static float level_power = 0;
+          static int8_t sensed = -1;  // -1 unknown, 0 absent, 1 present
+          static bool armed = false, failed = false;
+          const uint32_t now = millis();
+          const bool enabled = id(line_in_signal_detection).state;
+          const bool streaming = id(sendspin_hub)->is_source_streaming();
+          const size_t free_ram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+          // From the moment a source starts until its audio has drained
+          auto http_active = [](auto *source) {
+            const auto state = source->get_state();
+            return state == media_source::MediaSourceState::PLAYING ||
+                   state == media_source::MediaSourceState::PAUSED ||
+                   (state == media_source::MediaSourceState::IDLE && !source->is_idle());
+          };
+          const auto sendspin_state = id(sendspin_source)->get_state();
+          const bool playing = id(external_media_player).state != media_player::MEDIA_PLAYER_STATE_IDLE ||
+              id(sendspin_group_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING ||
+              sendspin_state == media_source::MediaSourceState::PLAYING ||
+              sendspin_state == media_source::MediaSourceState::PAUSED ||
+              http_active(id(http_media_source)) || http_active(id(http_announcement_source)) ||
+              !id(media_resampling_speaker).is_stopped() || !id(announcement_resampling_speaker).is_stopped() ||
+              !id(media_mixer_input).is_stopped() || !id(announcement_mixer_input).is_stopped();
+          const bool idle = enabled && !streaming && !playing && free_ram >= 40960 &&
+              id(audio_output).current_option() == "Optical" &&
+              id(output_router).get_active_output() == id(spdif_speaker) && id(output_router).is_stopped() &&
+              id(spdif_speaker).is_stopped() && id(dac_speaker).is_stopped();
+          if (!idle)
+            idle_since = 0;
+          else if (idle_since == 0)
+            idle_since = now;
+
+          if (id(line_sense_holding)) {
+            const bool stuck = !id(line_in_adc).is_running() && now - hold_start > 3000;
+            if (!idle || stuck) {
+              id(line_in_adc).stop();
+              id(line_sense_holding) = false;
+              ESP_LOGD("line_in", "Stopped listening to Line In");
+              if (stuck) {
+                failed = true;
+                failed_at = now;
+                ESP_LOGW("line_in", "Line In Signal Detection paused for 10 minutes: the input didn't start");
+              }
+            }
+          } else if (idle && now - idle_since >= 5000 && (!failed || now - failed_at >= 600000) &&
+                     id(line_in_adc).is_stopped() && !id(check_for_update).is_running() &&
+                     (id(wifi_1).is_disabled() || !id(wifi_recovery_probe).is_running()) &&
+                     xTaskGetHandle("update_task") == nullptr &&
+                     free_ram >= 65536 &&
+                     heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 16384) {
+            if (id(line_in_ram_ok)()) {
+              id(line_in_adc).start();
+              id(line_sense_holding) = true;
+              hold_start = now;
+              failed = false;
+              ESP_LOGD("line_in", "Listening to Line In");
+            } else {
+              // Tries again in 5 s
+              idle_since = now;
+            }
+          }
+
+          if (!enabled || !id(line_in_adc).is_running() || !(streaming || id(line_sense_holding))) {
+            if (measure_start != 0) {
+              measure_start = 0;
+              id(line_in_level).publish_state(NAN);
+              id(line_in_signal).invalidate_state();
+            }
+            if (!playing)
+              playing_since = 0;
+            else if (playing_since == 0)
+              playing_since = now;
+            // After a minute of other playback, away from Optical, or with detection off, the next reading is only a
+            // baseline
+            if (!enabled || id(audio_output).current_option() != "Optical" ||
+                (playing_since != 0 && now - playing_since > 60000)) {
+              sensed = -1;
+              armed = false;
+            }
+            // Turning detection off takes back an absent signal during a stream, so Music Assistant doesn't stop it
+            if (!enabled && streaming && !id(line_sense_reported)) {
+              id(line_sense_reported) = true;
+              id(sendspin_hub)->set_source_signal(true);
+            }
+            return;
+          }
+          playing_since = 0;
+          if (measure_start == 0) {
+            measure_start = now;
+            loud = quiet = level_windows = 0;
+            level_power = 0;
+            last_window = id(line_sense_windows).load();
+          }
+          const uint32_t window = id(line_sense_windows).load();
+          if (window == last_window)
+            return;
+          last_window = window;
+          // The PCM1808 settles after its clocks start
+          if (now - measure_start < 1000)
+            return;
+
+          float power;
+          const uint32_t bits = id(line_sense_power).load();
+          memcpy(&power, &bits, sizeof(power));
+          const float db = power > 1e-12f ? 10.0f * log10f(power) : -120.0f;
+          level_power += power;
+          if (++level_windows >= 9) {
+            const float average = level_power / level_windows;
+            id(line_in_level).publish_state(average > 1e-12f ? 10.0f * log10f(average) : -120.0f);
+            level_power = 0;
+            level_windows = 0;
+          }
+
+          // Counted windows, so a thump doesn't start a signal. During a stream, and for the shorter first reading, run-out
+          // groove clicks only delay the end; while idle, a pause in an already playing source doesn't end it
+          const float on_db = id(line_in_signal_threshold).state;
+          const uint32_t penalty = streaming || sensed < 0 ? 2 : 10;
+          loud = db >= on_db ? loud + 1 : (loud > 0 ? loud - 1 : 0);
+          quiet = db < on_db - 6.0f ? quiet + 1 : (quiet > penalty ? quiet - penalty : 0);
+          if (sensed != 1 && loud >= 9) {
+            sensed = 1;
+            quiet = 0;
+          } else if (sensed != 0 && quiet >= (sensed < 0 ? 30u : 90u)) {
+            sensed = 0;
+            loud = 0;
+          }
+          if (sensed < 0)
+            return;
+          id(line_in_signal).publish_state(sensed == 1);
+          if (sensed == 0)
+            armed = true;
+
+          // Absent always; present after a rise heard while listening, or during a stream, so a source that was
+          // already playing when listening began doesn't autostart unless it first goes quiet for a few seconds
+          bool present = id(line_sense_reported);
+          if (sensed == 0)
+            present = false;
+          else if (armed || streaming)
+            present = true;
+          if (present == id(line_sense_reported))
+            return;
+          id(line_sense_reported) = present;
+          id(sendspin_hub)->set_source_signal(present);
+          ESP_LOGI("line_in", "Line In signal %s", present ? "present" : "absent");
+
 script:
   # The mic task reboots the unit if its sample buffer doesn't fit in internal RAM, so start it only once the DAC
   # has let go of the port and a trial of the same allocations succeeds
@@ -95,46 +377,57 @@ script:
     mode: restart
     then:
       - lambda: "id(line_in_can_start) = false;"
-      - wait_until:
-          condition:
-            lambda: |-
-              if (!id(sendspin_hub)->is_source_streaming())
-                return true;
-              if (!id(dac_speaker).is_stopped())
-                return false;
-              static uint32_t last_try = 0;
-              if (millis() - last_try < 100)
-                return false;
-              last_try = millis();
-              // An update check takes ~24 KB of its own
-              if (xTaskGetHandle("update_task") != nullptr)
-                return false;
-              // 4 RX DMA buffers, the mic task stack, its sample buffer, then the source's converted samples
-              const size_t sizes[] = {2048, 2048, 2048, 2048, 4096 + 512, 6144 + 512, 3072 + 512};
-              void *trial[7] = {};
-              bool ok = true;
-              for (int i = 0; ok && i < 7; i++) {
-                const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | (i < 4 ? MALLOC_CAP_DMA : 0);
-                ok = (trial[i] = heap_caps_malloc(sizes[i], caps)) != nullptr;
-              }
-              for (void *p : trial)
-                heap_caps_free(p);
-              id(line_in_can_start) = ok;
-              return ok;
-          timeout: 30s
+      # A start handed over by Line In Signal Detection already runs the ADC
       - if:
           condition:
-            lambda: "return id(line_in_can_start) && id(sendspin_hub)->is_source_streaming();"
+            lambda: "return !id(line_sense_handed_over);"
           then:
-            - microphone.capture: line_in_adc
-          else:
+            - wait_until:
+                condition:
+                  lambda: |-
+                    if (!id(sendspin_hub)->is_source_streaming())
+                      return true;
+                    // Also waits for a detection run that just ended to free its buffers
+                    if (!id(dac_speaker).is_stopped() || !id(line_in_adc).is_stopped())
+                      return false;
+                    static uint32_t last_try = 0;
+                    if (millis() - last_try < 100)
+                      return false;
+                    last_try = millis();
+                    // An update check takes ~24 KB of its own
+                    if (xTaskGetHandle("update_task") != nullptr)
+                      return false;
+                    id(line_in_can_start) = id(line_in_ram_ok)();
+                    return id(line_in_can_start);
+                timeout: 30s
             - if:
                 condition:
-                  lambda: "return id(sendspin_hub)->is_source_streaming();"
+                  lambda: "return id(line_in_can_start) && id(sendspin_hub)->is_source_streaming();"
                 then:
-                  - logger.log:
-                      level: WARN
-                      format: "Line In couldn't start: not enough free memory"
+                  - microphone.capture: line_in_adc
+                else:
+                  - if:
+                      condition:
+                        lambda: "return id(sendspin_hub)->is_source_streaming();"
+                      then:
+                        - logger.log:
+                            level: WARN
+                            format: "Line In couldn't start: not enough free memory"
+
+  # Gives the ADC's port back before the Analog output needs it
+  - id: line_in_signal_detection_release
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(line_sense_holding)) {
+            id(line_in_adc).stop();
+            id(line_sense_holding) = false;
+          }
+      # Also covers a start the monitor just released
+      - wait_until:
+          condition:
+            lambda: "return id(line_in_adc).is_stopped() || id(sendspin_hub)->is_source_streaming();"
+          timeout: 200ms
 
   - id: line_in_streaming_restart
     mode: restart
