@@ -626,6 +626,8 @@ sendspin:
 media_source:
   - platform: sendspin
     id: sendspin_source
+    # Gives Music Assistant a delay slider (starts at 0), e.g. to line up a soundbar on Optical with other rooms
+    static_delay_adjustable: true
 
   - platform: audio_http
     id: http_media_source
