@@ -98,4 +98,4 @@ Power long strips from their own 5V supply with a shared ground. The terminals c
 Discord (Support/feedback/discussion/future products): [http://dsc.gg/ApolloAutomation](http://dsc.gg/ApolloAutomation) \
 Shop: [https://apolloautomation.com/products/cast-1-pro](https://apolloautomation.com/products/cast-1-pro) \
 Wiki: [https://wiki.apolloautomation.com/products/castpro1/introduction/](https://wiki.apolloautomation.com/products/castpro1/introduction/) \
-Web installer: [https://apolloautomation.github.io/CAST_PRO-1/](https://apolloautomation.github.io/CAST_PRO-1/)
+Web installer: [https://install.apolloautomation.com/#/cast-pro-1](https://install.apolloautomation.com/#/cast-pro-1)
