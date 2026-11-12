@@ -49,6 +49,9 @@ globals:
     type: std::atomic<uint32_t>
   - id: line_sense_windows
     type: std::atomic<uint32_t>
+  # Loudest raw sample since the last clip check
+  - id: line_in_peak_code
+    type: std::atomic<uint32_t>
 
 esphome:
   on_boot:
@@ -80,10 +83,15 @@ esphome:
                 return;
               const int32_t *samples = reinterpret_cast<const int32_t *>(capture.data.data());
               const size_t count = capture.data.size() / 8;
+              uint32_t peak = 0;
               for (size_t i = 0; i < 2 * count; i++) {
                 const int32_t x = samples[i] >> 8;
                 sum[i & 1] += x;
                 squares[i & 1] += (int64_t) x * x;
+                peak = std::max(peak, (uint32_t) std::abs(x));
+              }
+              uint32_t seen = id(line_in_peak_code).load();
+              while (peak > seen && !id(line_in_peak_code).compare_exchange_weak(seen, peak)) {
               }
               frames += count;
               if (frames < 4800)
@@ -202,6 +210,13 @@ binary_sensor:
     entity_category: diagnostic
     disabled_by_default: true
 
+  # On while the source is too loud for the input
+  - platform: template
+    id: line_in_clipping
+    name: "Line In Clipping"
+    icon: mdi:alert-outline
+    entity_category: diagnostic
+
 sensor:
   # About a second's average while the unit listens
   - platform: template
@@ -215,7 +230,49 @@ sensor:
     disabled_by_default: true
     update_interval: never
 
+  # Loudest sample each second while the input runs
+  - platform: template
+    id: line_in_peak
+    name: "Line In Peak"
+    icon: mdi:volume-high
+    unit_of_measurement: "dBFS"
+    accuracy_decimals: 1
+    state_class: measurement
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+
 interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          static bool measuring = false;
+          static uint32_t clipped_at = 0;
+          const uint32_t peak = id(line_in_peak_code).exchange(0);
+          if (!id(line_in_adc).is_running()) {
+            if (measuring || !id(line_in_clipping).has_state()) {
+              measuring = false;
+              id(line_in_peak).publish_state(NAN);
+              id(line_in_clipping).publish_state(false);
+            }
+            return;
+          }
+          // Skips the first second while the ADC settles
+          if (!measuring) {
+            measuring = true;
+            return;
+          }
+          id(line_in_peak).publish_state(peak > 0 ? 20.0f * log10f(peak / 8388608.0f) : -120.0f);
+          // Within 0.1 dB of full scale; idle thumps don't count
+          if (peak >= 8292000 && id(sendspin_hub)->is_source_streaming()) {
+            if (!id(line_in_clipping).state)
+              ESP_LOGW("line_in", "Line In hit full scale; if it repeats, turn the source down");
+            clipped_at = millis();
+            id(line_in_clipping).publish_state(true);
+          } else if (id(line_in_clipping).state && millis() - clipped_at > 5000) {
+            id(line_in_clipping).publish_state(false);
+          }
+
   # Listens while idle only on Optical, where the analog DAC never needs the ADC's port, and gives the port back as
   # soon as anything plays. Only changes are sent to Music Assistant
   - id: line_in_signal_monitor

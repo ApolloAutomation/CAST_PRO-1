@@ -33,6 +33,7 @@ Plug a line-level source into the **Analog In** jack (also called Line In), the 
 
 - **Line In Streaming** sets the quality: **Compressed** (the default, best for WiFi) or **Lossless** (for Ethernet or strong WiFi). Changing it restarts the device.
 - Analog In and the analog output can't run at the same time. While Analog In streams, this CAST PRO-1 plays only through its optical output.
+- If loud parts crackle, the source is too strong for Analog In, and **Line In Clipping** (under Diagnostic) turns on. Turn the source down, or add an inline attenuator of about -10 dB.
 
 To start Analog In automatically when a record or TV starts playing, turn on **Line In Signal Detection** on the device page. Music Assistant then plays it on this CAST PRO-1 and stops it a minute or so after the sound ends. To play it on another player, go to **Settings → Players** in Music Assistant, open the CAST PRO-1, and change **Automatically play line-in on**.
 
