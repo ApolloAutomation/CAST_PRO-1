@@ -665,6 +665,8 @@ sendspin:
 media_source:
   - platform: sendspin
     id: sendspin_source
+    # FLAC and PCM arrive in 24-bit; Opus stays 16-bit
+    bits_per_sample: 24
     # Gives Music Assistant a delay slider (starts at 0), e.g. to line up a soundbar on Optical with other rooms
     static_delay_adjustable: true
 
