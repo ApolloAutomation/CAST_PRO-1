@@ -61,7 +61,7 @@ Use the **Network Connection** sensor (under Diagnostic on the device page) to s
 
 The boot button is the second recessed button from the left, next to reset. Press it with a pin:
 
-- **Hold about 3 seconds** for a status check. The onboard LEDs show **blue** when connected to Home Assistant, **green** when on your network without Home Assistant, or **yellow** with no network. They then flash green once more to show the component check passed.
+- **Tap** for a status check. The onboard LEDs show **blue** when connected to Home Assistant, **green** when on your network without Home Assistant, or **yellow** with no network. They then flash green once more to show the component check passed.
 - **Hold 10 seconds** to factory reset. Unplug the Ethernet cable first, since the setup hotspot only appears without it.
 
 See [Status check and factory reset](https://wiki.apolloautomation.com/products/castpro1/troubleshooting/castpro1-boot-button/) for more.
