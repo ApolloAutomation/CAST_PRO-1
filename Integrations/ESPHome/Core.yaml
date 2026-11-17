@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.11.16.2"
+  version: "26.11.17.1"
   stable_manifest_base: "https://apolloautomation.github.io/CAST_PRO-1"
   beta_manifest_base: "https://github.com/ApolloAutomation/CAST_PRO-1/releases/download/beta-fw"
   ota_stable_manifest: "${stable_manifest_base}/firmware/manifest.json"
@@ -44,6 +44,17 @@ esphome:
     # Without a W5500 its task polls a floating bus and panics; after ethernet (250)
     - priority: 200
       then:
+        # Cable link, which comes before an IP
+        - lambda: |-
+            esp_event_handler_register(
+                ETH_EVENT, ESP_EVENT_ANY_ID,
+                [](void *, esp_event_base_t, int32_t event, void *) {
+                  if (event == ETHERNET_EVENT_CONNECTED)
+                    id(ethernet_link) = true;
+                  else if (event == ETHERNET_EVENT_DISCONNECTED || event == ETHERNET_EVENT_STOP)
+                    id(ethernet_link) = false;
+                },
+                nullptr);
         - if:
             condition:
               lambda: "return id(ethernet_1).is_failed();"
@@ -70,8 +81,22 @@ esphome:
             then:
               - wait_until:
                   condition:
-                    ethernet.connected:
-                  timeout: 20s
+                    lambda: "return id(ethernet_1).is_connected() || id(ethernet_link);"
+                  timeout: 10s
+              # A switch port running STP can hold traffic ~30 s
+              - wait_until:
+                  condition:
+                    lambda: "return id(ethernet_1).is_connected() || !id(ethernet_link);"
+                  timeout: 60s
+              # No WiFi saved: wait longer instead of a hotspot reboot
+              - if:
+                  condition:
+                    lambda: "return !id(ethernet_1).is_connected() && id(ethernet_link) && !id(wifi_provisioned);"
+                  then:
+                    - wait_until:
+                        condition:
+                          lambda: "return id(ethernet_1).is_connected() || !id(ethernet_link);"
+                        timeout: 4min
               - if:
                   condition:
                     not:
@@ -131,7 +156,7 @@ ethernet:
   interrupt_pin: GPIO5
   reset_pin: GPIO21
   on_connect:
-    # Keep WiFi alongside Ethernet unless it has no network
+    # WiFi stays only until Ethernet takes over
     - if:
         condition:
           wifi.enabled:
@@ -153,6 +178,7 @@ ethernet:
                       wifi.connected:
                     then:
                       - lambda: "id(ethernet_expected) = false;"
+                      - script.execute: ethernet_takeover
                     else:
                       - if:
                           condition:
@@ -164,7 +190,11 @@ ethernet:
     - script.execute: check_for_update
     - component.update: network_connection
   on_disconnect:
-    - lambda: "id(ethernet_expected) = false;"
+    - script.stop: ethernet_takeover
+    - script.stop: ethernet_takeover_check
+    - lambda: |-
+        id(ethernet_expected) = false;
+        id(ethernet_takeover_failed) = false;
     - wifi.enable:
     - component.update: network_connection
 
@@ -256,7 +286,12 @@ api:
   id: api_1
   # Sendspin works without an API client, so don't reboot for lack of one
   reboot_timeout: 0s
+  # Dials Home Assistant back, so a new IP doesn't strand it
+  outgoing_connection:
+    delay: 10s
   encryption:
+  on_client_connected:
+    - lambda: "id(home_assistant_seen) = true;"
 
 globals:
   - id: cycleCounter
@@ -283,8 +318,20 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'false'
-  # WiFi has connected before; the recovery probe never runs otherwise
+  # WiFi has connected before
   - id: wifi_provisioned
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: ethernet_link
+    type: std::atomic<bool>
+  # HA never reached us over Ethernet; keep WiFi too
+  - id: ethernet_takeover_failed
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  # Music Assistant-only units skip the reachability check
+  - id: home_assistant_seen
     type: bool
     restore_value: yes
     initial_value: 'false'
@@ -755,7 +802,7 @@ media_player:
 
 
 interval:
-  # Retry a released WiFi while on Ethernet
+  # Rejoins WiFi when Home Assistant needs it
   - id: wifi_recovery_interval
     interval: 10min
     then:
@@ -765,7 +812,7 @@ interval:
               - ethernet.connected:
               - not:
                   wifi.enabled:
-              - lambda: "return id(wifi_provisioned);"
+              - lambda: "return id(wifi_provisioned) && id(ethernet_takeover_failed);"
           then:
             - script.execute: wifi_recovery_probe
 
@@ -811,6 +858,69 @@ script:
                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 32768 &&
                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 10240;
       - component.update: update_http_request
+
+  # Moves everything to Ethernet once stable and idle
+  - id: ethernet_takeover
+    mode: restart
+    then:
+      - delay: 30s
+      - wait_until:
+          condition:
+            for:
+              time: 30s
+              condition:
+                lambda: |-
+                  const auto state = id(external_media_player).state;
+                  return state != media_player::MEDIA_PLAYER_STATE_PLAYING &&
+                         state != media_player::MEDIA_PLAYER_STATE_PAUSED &&
+                         state != media_player::MEDIA_PLAYER_STATE_ANNOUNCING &&
+                         !id(sendspin_hub)->is_source_streaming();
+      - if:
+          condition:
+            and:
+              - ethernet.connected:
+              - wifi.enabled:
+              - lambda: "return !id(ethernet_takeover_failed);"
+          then:
+            # Home Assistant dials back in over Ethernet
+            - lambda: |-
+                for (auto &client : api::global_api_server->active_clients()) {
+                  api::DisconnectRequest req;
+                  (void) client->send_message(req);
+                }
+            - delay: 1s
+            - script.execute: wifi_release_radio
+            - if:
+                condition:
+                  lambda: "return id(home_assistant_seen);"
+                then:
+                  - script.execute: ethernet_takeover_check
+
+  # Brings WiFi back if Home Assistant can't reach Ethernet
+  - id: ethernet_takeover_check
+    mode: restart
+    then:
+      - delay: 10s
+      - wait_until:
+          condition:
+            api.connected:
+              state_subscription_only: true
+          timeout: 5min
+      - if:
+          condition:
+            and:
+              - not:
+                  api.connected:
+                    state_subscription_only: true
+              - ethernet.connected:
+              - not:
+                  wifi.enabled:
+          then:
+            - lambda: |-
+                ESP_LOGW("network", "Home Assistant didn't reconnect over Ethernet; keeping WiFi on too");
+                id(ethernet_takeover_failed) = true;
+                id(ethernet_expected) = false;
+            - wifi.enable:
 
   # Restarting WiFi as an announcement starts on low internal RAM can crash the unit, so probe only after a minute
   # with RAM to spare, and if playback starts meanwhile, release the radio once its pipeline is up
