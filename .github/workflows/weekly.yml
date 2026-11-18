@@ -14,7 +14,7 @@ jobs:
     with:
       yaml-files: |
         Integrations/ESPHome/CAST_PRO-1.yaml
+      # Same versions as ci.yml: the firmware needs ESPHome 2026.11
+      # (min_version), so stable and beta fail until it ships there.
       esphome-versions: |
-        stable
-        beta
         dev
