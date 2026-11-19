@@ -185,7 +185,7 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
 
 number:
-  # A signal starts after about 1 s at or above this level and ends after about 10 s at 6 dB below it
+  # A signal starts after about 0.5 s at or above this level and ends after about 10 s at 6 dB below it
   - platform: template
     id: line_in_signal_threshold
     name: "Line In Signal Threshold"
@@ -401,7 +401,7 @@ interval:
           const uint32_t penalty = streaming || sensed < 0 ? 2 : 10;
           loud = db >= on_db ? loud + 1 : (loud > 0 ? loud - 1 : 0);
           quiet = db < on_db - 6.0f ? quiet + 1 : (quiet > penalty ? quiet - penalty : 0);
-          if (sensed != 1 && loud >= 9) {
+          if (sensed != 1 && loud >= 5) {
             sensed = 1;
             quiet = 0;
           } else if (sensed != 0 && quiet >= (sensed < 0 ? 30u : 90u)) {
