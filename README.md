@@ -50,7 +50,7 @@ Group the CAST PRO-1 with other CAST players in Music Assistant to play the same
 
 One firmware covers both WiFi and Ethernet, so there is no need to pick a variant or reflash to switch:
 
-- **Ethernet plugged in:** traffic moves to Ethernet. If the device is also joined to your WiFi, that connection stays up alongside, so Home Assistant never loses the device when you plug or unplug the cable. If WiFi has no network to join, it turns off entirely, and the setup hotspot is never active while Ethernet is connected.
+- **Ethernet plugged in:** Ethernet takes priority. Once the cable has worked for 30 seconds and nothing is playing, WiFi turns off and Home Assistant (2026.10 or newer) and Music Assistant reconnect over Ethernet. If Home Assistant can't reach the device over Ethernet within 5 minutes (for example, a separate VLAN), WiFi turns back on and both stay connected. Unplug and replug the cable to try Ethernet-only again. To change WiFi networks, unplug the cable first.
 - **No Ethernet:** WiFi works as usual. The device rejoins its saved network, or opens the "Apollo CAST_PRO-1 Hotspot" for setup if none is configured (Improv via Bluetooth or USB works too).
 
 When you join the hotspot, your phone should open the WiFi setup page on its own. If it doesn't, go to [http://192.168.4.1/setup](http://192.168.4.1/setup). The bare http://192.168.4.1 address opens the device's web page instead.
