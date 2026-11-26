@@ -54,9 +54,7 @@ jobs:
     uses: esphome/workflows/.github/workflows/build.yml@e1432c7b31fec7d24a13dc192953ebac836ed98a # 2026.10.3
     with:
       files: ${{ matrix.yaml }}
-      # The firmware needs ESPHome 2026.11 (min_version), which is only on dev
-      # until 2026.11.0b1 ships. Set back to beta once it does.
-      esphome-version: dev
+      esphome-version: beta
       combined-name: ${{ matrix.name }}
       release-version: ${{ needs.version.outputs.v }}
 
