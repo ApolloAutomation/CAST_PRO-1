@@ -27,6 +27,4 @@ jobs:
     with:
       # Key "" publishes manifest.json, the file devices fetch (ota_beta_manifest)
       variants: '[{"key": "", "yaml": "Integrations/ESPHome/CAST_PRO-1.yaml", "name": "firmware"}]'
-      # The firmware needs ESPHome 2026.11 (min_version), which is only on dev
-      # until 2026.11.0b1 ships. Set back to beta once it does.
-      esphome-version: dev
+      esphome-version: beta
